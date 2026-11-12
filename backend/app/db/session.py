@@ -17,13 +17,16 @@ def get_engine():
             connect_args["statement_cache_size"] = 0
             connect_args["prepared_statement_cache_size"] = 0
 
+        pool_options: dict[str, int] = {}
+        if not settings.database_url.startswith("sqlite"):
+            pool_options.update(pool_size=5, max_overflow=10)
+
         _engine = create_async_engine(
             settings.database_url,
             echo=settings.environment == "development",
             pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
             connect_args=connect_args,
+            **pool_options,
         )
     return _engine
 

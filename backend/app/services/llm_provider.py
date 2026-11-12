@@ -7,14 +7,61 @@ from abc import ABC, abstractmethod
 import asyncio
 import json
 import logging
+import random
 import re
+import time
 from typing import Any
+from weakref import WeakKeyDictionary
 import httpx
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 
 logger = logging.getLogger("agentforge.llm")
+
+
+class _GroqRequestGate:
+    """Share Groq concurrency and rate-limit cooldown across runs on this event loop."""
+
+    def __init__(self, max_concurrent_requests: int):
+        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self._cooldown_until = 0.0
+        self._cooldown_lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        while True:
+            await self._semaphore.acquire()
+            async with self._cooldown_lock:
+                wait_seconds = self._cooldown_until - asyncio.get_running_loop().time()
+            if wait_seconds <= 0:
+                return self
+            self._semaphore.release()
+            await asyncio.sleep(wait_seconds)
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        self._semaphore.release()
+
+    async def defer_requests(self, wait_seconds: float) -> None:
+        async with self._cooldown_lock:
+            loop = asyncio.get_running_loop()
+            self._cooldown_until = max(
+                self._cooldown_until,
+                loop.time() + wait_seconds,
+            )
+
+
+_groq_gates: WeakKeyDictionary[asyncio.AbstractEventLoop, _GroqRequestGate] = (
+    WeakKeyDictionary()
+)
+
+
+def _get_groq_request_gate() -> _GroqRequestGate:
+    loop = asyncio.get_running_loop()
+    gate = _groq_gates.get(loop)
+    if gate is None:
+        gate = _GroqRequestGate(get_settings().groq_max_concurrent_requests)
+        _groq_gates[loop] = gate
+    return gate
 
 
 class LLMStepResponse(BaseModel):
@@ -232,6 +279,8 @@ class GroqProvider(LLMProvider):
             )
         self._api_key = settings.groq_api_key
         self._model = settings.groq_model
+        self._max_retries = settings.groq_max_retries
+        self._retry_max_delay_seconds = settings.groq_retry_max_delay_seconds
         self._client = httpx.AsyncClient(
             base_url=self._BASE_URL,
             headers={"Authorization": f"Bearer {self._api_key}"},
@@ -245,7 +294,8 @@ class GroqProvider(LLMProvider):
         Key behaviour:
         - When ``tools`` is non-empty, sends ``tool_choice='auto'``.
         - When no tools are provided, sends ``tool_choice='none'``.
-        - Handles 429 rate limit (TPM limit) with backoff and retry.
+        - Retries transient network, 429, and server errors with bounded backoff.
+        - Shares a cooldown and request concurrency limit across runs.
         - Handles 400 "Tool choice is none, but model called a tool" by retrying with
           an explicit disallow system message so the generation does not fail.
         """
@@ -265,9 +315,26 @@ class GroqProvider(LLMProvider):
         else:
             payload["tool_choice"] = "none"
 
-        max_retries = 2
+        max_retries = self._max_retries
+        gate = _get_groq_request_gate()
         for attempt in range(max_retries + 1):
-            resp = await self._client.post("/chat/completions", json=payload)
+            try:
+                async with gate:
+                    resp = await self._client.post("/chat/completions", json=payload)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt >= max_retries:
+                    raise
+                wait_s = self._backoff_delay(attempt)
+                logger.warning(
+                    "Groq network error (%s); retrying in %.1fs (attempt %d/%d)",
+                    type(exc).__name__,
+                    wait_s,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
             if resp.status_code == 200:
                 data = resp.json()
                 logger.debug(
@@ -298,31 +365,20 @@ class GroqProvider(LLMProvider):
                 err_msg[:500],
             )
 
-            # Handle 429 Rate Limit (TPM token limit exceeded)
-            if resp.status_code == 429 and attempt < max_retries:
-                retry_after = resp.headers.get("retry-after")
-                wait_s = 5.0
-                if retry_after:
-                    try:
-                        wait_s = float(retry_after)
-                    except ValueError:
-                        pass
-                else:
-                    m = re.search(r"try again in ([\d\.]+)s", err_msg)
-                    if m:
-                        try:
-                            wait_s = float(m.group(1))
-                        except ValueError:
-                            pass
-                wait_s = min(max(wait_s, 2.0), 25.0)
+            # Rate limits and transient upstream errors share a process-wide cooldown.
+            if resp.status_code in {408, 429, 500, 502, 503, 504} and attempt < max_retries:
+                wait_s = self._retry_delay(resp, err_msg, attempt)
+                if resp.status_code == 429:
+                    await gate.defer_requests(wait_s)
                 logger.info(
-                    "Groq TPM rate limit reached on %s; waiting %.1fs before retry (attempt %d/%d)...",
+                    "Groq API returned %d for %s; waiting %.1fs before retry (attempt %d/%d)",
+                    resp.status_code,
                     self._model,
                     wait_s,
                     attempt + 1,
                     max_retries,
                 )
-                await asyncio.sleep(wait_s + 0.5)
+                await asyncio.sleep(wait_s)
                 continue
 
             # Handle 400 "Tool choice is none, but model called a tool" / tool_use_failed
@@ -351,6 +407,38 @@ class GroqProvider(LLMProvider):
 
         resp.raise_for_status()
         return resp.json()
+
+    def _backoff_delay(self, attempt: int) -> float:
+        delay = min(2**attempt, self._retry_max_delay_seconds)
+        return min(
+            delay + random.uniform(0, min(delay * 0.25, 1.0)),
+            self._retry_max_delay_seconds,
+        )
+
+    def _retry_delay(
+        self,
+        response: httpx.Response,
+        error_message: str,
+        attempt: int,
+    ) -> float:
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return min(
+                    max(float(retry_after), 0.0),
+                    self._retry_max_delay_seconds,
+                )
+            except ValueError:
+                pass
+
+        match = re.search(r"try again in ([\d.]+)s", error_message, re.IGNORECASE)
+        if match:
+            return min(
+                max(float(match.group(1)), 0.0),
+                self._retry_max_delay_seconds,
+            )
+
+        return self._backoff_delay(attempt)
 
     async def generate(self, prompt: str, *, system_instruction: str | None = None) -> str:
         """Generate text using Groq."""
@@ -590,16 +678,16 @@ class MockProvider(LLMProvider):
             return {
                 "tasks": [
                     {
-                        "title": "Search for Python SWE Internships",
-                        "description": "Discover current software engineering internships suitable for 2nd-year BTech students using web search.",
+                        "title": "Find Python SWE internship opportunities",
+                        "description": "Search for current software engineering internships suitable for 2nd-year BTech students.",
                     },
                     {
-                        "title": "Extract Eligibility and Deadline Details",
-                        "description": "Extract full page details for top opportunities to verify requirements, stipends, and deadlines.",
+                        "title": "Research eligibility and application timelines",
+                        "description": "Find authoritative information about eligibility, skills, and application timelines for suitable internships.",
                     },
                     {
-                        "title": "Compare Opportunities & Synthesize Findings",
-                        "description": "Compare eligibility criteria, locations, tech stacks, and prepare structured recommendations.",
+                        "title": "Find internship preparation recommendations",
+                        "description": "Research practical preparation steps and skills that improve readiness for software engineering internships.",
                     },
                 ]
             }
@@ -615,8 +703,8 @@ class MockProvider(LLMProvider):
                     "description": "Gather live data and authoritative sources using search and extraction tools.",
                 },
                 {
-                    "title": "Synthesize Evidence & Formulate Recommendations",
-                    "description": "Evaluate the gathered evidence, perform calculations if needed, and draft the final conclusions.",
+                    "title": "Find Additional Evidence and Perspectives",
+                    "description": "Research independent sources and perspectives relevant to the user's goal.",
                 },
             ]
         }

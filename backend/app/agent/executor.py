@@ -1,8 +1,10 @@
-"""Executor — executes tasks sequentially with iterative tool use, context passing, and source tracking."""
+"""Executor — runs one task with iterative tool use, context passing, and source tracking."""
 
+import asyncio
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +17,40 @@ from app.tools.registry import ToolRegistry, create_default_registry
 from app.core.config import get_settings
 
 logger = logging.getLogger("agentforge.executor")
+
+
+class RunToolBudget:
+    """Reserve a bounded number of tool calls across concurrently executing tasks."""
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._used = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def used_calls(self) -> int:
+        return self._used
+
+    @property
+    def exhausted(self) -> bool:
+        return self._used >= self._limit
+
+    async def reserve(self) -> bool:
+        async with self._lock:
+            if self._used >= self._limit:
+                return False
+            self._used += 1
+            return True
+
+
+@asynccontextmanager
+async def _session_access(lock: asyncio.Lock | None):
+    if lock is None:
+        yield
+    else:
+        async with lock:
+            yield
+
 
 EXECUTION_SYSTEM_PROMPT = """You are an autonomous task execution AI for AgentForge.
 You have access to real tools:
@@ -51,6 +87,9 @@ class Executor:
         previous_results: list[dict],
         session: AsyncSession,
         run_total_tools: int = 0,
+        session_lock: asyncio.Lock | None = None,
+        tool_budget: RunToolBudget | None = None,
+        run_seen_urls: set[str] | None = None,
     ) -> tuple[str, list[dict], int]:
         """Execute a single task with iterative tool calling.
 
@@ -68,10 +107,11 @@ class Executor:
             RuntimeError: If execution fails critically.
         """
         # Mark task as in_progress
-        task.status = TaskStatus.IN_PROGRESS
-        task.started_at = datetime.now(timezone.utc)
-        session.add(task)
-        await session.commit()
+        async with _session_access(session_lock):
+            task.status = TaskStatus.IN_PROGRESS
+            task.started_at = datetime.now(timezone.utc)
+            session.add(task)
+            await session.commit()
 
         logger.info("Starting execution of task %d: %s", task.order_index + 1, task.title)
 
@@ -80,10 +120,13 @@ class Executor:
         max_run_tools = self._settings.max_tool_calls_per_run
 
         # Fetch existing URLs for this run to avoid duplicate source records
-        existing_url_res = await session.execute(
-            select(Source.url).where(Source.run_id == task.run_id)
-        )
-        seen_urls = set(existing_url_res.scalars().all())
+        async with _session_access(session_lock):
+            existing_url_res = await session.execute(
+                select(Source.url).where(Source.run_id == task.run_id)
+            )
+            existing_urls = existing_url_res.scalars().all()
+            seen_urls = run_seen_urls if run_seen_urls is not None else set()
+            seen_urls.update(existing_urls)
 
         accumulated_sources: list[dict] = []
         task_tools_count = 0
@@ -98,7 +141,11 @@ class Executor:
 
         # ── Iterative Agentic Tool Loop ──────────────────────────────────────
         for iteration in range(1, max_task_tools + 1):
-            if run_total_tools + task_tools_count >= max_run_tools:
+            if (
+                tool_budget.exhausted
+                if tool_budget is not None
+                else run_total_tools + task_tools_count >= max_run_tools
+            ):
                 logger.warning(
                     "Run tool limit reached (%d/%d). Halting tool calls for task %d.",
                     run_total_tools + task_tools_count,
@@ -119,6 +166,10 @@ class Executor:
                 break
 
             if step.is_tool_call and step.tool_name:
+                if tool_budget is not None and not await tool_budget.reserve():
+                    logger.warning("Run tool limit reached; skipping additional tool call.")
+                    break
+
                 tool_name = step.tool_name
                 tool_args = step.tool_args or {}
 
@@ -139,52 +190,54 @@ class Executor:
                     status=ToolCallStatus.RUNNING,
                     started_at=datetime.now(timezone.utc),
                 )
-                session.add(tool_call)
-                await session.commit()
-                await session.refresh(tool_call)
+                async with _session_access(session_lock):
+                    session.add(tool_call)
+                    await session.commit()
+                    await session.refresh(tool_call)
 
                 # 2. Execute the tool via registry (validates arguments and handles timeouts)
                 result = await self._registry.execute(tool_name, tool_args)
 
                 # 3. Update ToolCall record
-                tool_call.status = ToolCallStatus.COMPLETED if result.success else ToolCallStatus.FAILED
-                tool_call.result_summary = result.summary
-                tool_call.result_data = (
-                    json.dumps(result.output)
-                    if isinstance(result.output, (dict, list))
-                    else str(result.output or "")
-                )
-                tool_call.error_message = result.error
-                tool_call.completed_at = datetime.now(timezone.utc)
-                session.add(tool_call)
+                async with _session_access(session_lock):
+                    tool_call.status = ToolCallStatus.COMPLETED if result.success else ToolCallStatus.FAILED
+                    tool_call.result_summary = result.summary
+                    tool_call.result_data = (
+                        json.dumps(result.output)
+                        if isinstance(result.output, (dict, list))
+                        else str(result.output or "")
+                    )
+                    tool_call.error_message = result.error
+                    tool_call.completed_at = datetime.now(timezone.utc)
+                    session.add(tool_call)
 
-                # 4. Persist newly discovered Sources
-                for src in result.sources:
-                    url = src.get("url", "")
-                    if url and url not in seen_urls:
-                        seen_urls.add(url)
-                        status_str = src.get("extraction_status", "snippet_only")
-                        ext_status = (
-                            ExtractionStatus.EXTRACTED
-                            if status_str == "extracted"
-                            else ExtractionStatus.SNIPPET_ONLY
-                        )
+                    # 4. Persist newly discovered Sources
+                    for src in result.sources:
+                        url = src.get("url", "")
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            status_str = src.get("extraction_status", "snippet_only")
+                            ext_status = (
+                                ExtractionStatus.EXTRACTED
+                                if status_str == "extracted"
+                                else ExtractionStatus.SNIPPET_ONLY
+                            )
 
-                        source_record = Source(
-                            run_id=task.run_id,
-                            task_id=task.id,
-                            tool_call_id=tool_call.id,
-                            title=src.get("title", "Untitled Source"),
-                            url=url,
-                            domain=src.get("domain", ""),
-                            snippet=src.get("snippet"),
-                            extracted_content=src.get("extracted_content"),
-                            extraction_status=ext_status,
-                        )
-                        session.add(source_record)
-                        accumulated_sources.append(src)
+                            source_record = Source(
+                                run_id=task.run_id,
+                                task_id=task.id,
+                                tool_call_id=tool_call.id,
+                                title=src.get("title", "Untitled Source"),
+                                url=url,
+                                domain=src.get("domain", ""),
+                                snippet=src.get("snippet"),
+                                extracted_content=src.get("extracted_content"),
+                                extraction_status=ext_status,
+                            )
+                            session.add(source_record)
+                            accumulated_sources.append(src)
 
-                await session.commit()
+                    await session.commit()
                 task_tools_count += 1
 
                 # 5. Append tool interaction to conversation history
@@ -239,23 +292,25 @@ class Executor:
                         )
                     else:
                         user_msg = "Task execution failed. Please retry the run."
-                    task.status = TaskStatus.FAILED
-                    task.result = user_msg
-                    task.error_message = raw[:500]
-                    task.completed_at = datetime.now(timezone.utc)
-                    session.add(task)
-                    await session.commit()
+                    async with _session_access(session_lock):
+                        task.status = TaskStatus.FAILED
+                        task.result = user_msg
+                        task.error_message = raw[:500]
+                        task.completed_at = datetime.now(timezone.utc)
+                        session.add(task)
+                        await session.commit()
                     return task.result, accumulated_sources, task_tools_count
 
         if not final_content or not final_content.strip():
             final_content = "Task executed; evidence collected from tools was saved."
 
         # Mark task as completed
-        task.status = TaskStatus.COMPLETED
-        task.result = final_content.strip()
-        task.completed_at = datetime.now(timezone.utc)
-        session.add(task)
-        await session.commit()
+        async with _session_access(session_lock):
+            task.status = TaskStatus.COMPLETED
+            task.result = final_content.strip()
+            task.completed_at = datetime.now(timezone.utc)
+            session.add(task)
+            await session.commit()
 
         logger.info(
             "Task %d completed successfully (%d tool calls executed)",

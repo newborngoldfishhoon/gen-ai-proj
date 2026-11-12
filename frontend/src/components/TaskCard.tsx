@@ -1,7 +1,7 @@
 import React from 'react';
 import type { AgentTask } from '../types/agent';
 import StatusBadge from './StatusBadge';
-import { ChevronDown, ChevronUp, Search, Calculator, FileText, Terminal, Wrench } from 'lucide-react';
+import { ChevronDown, ChevronUp, Search, Calculator, FileText, Terminal, Wrench, Sparkles } from 'lucide-react';
 
 interface TaskCardProps {
   task: AgentTask;
@@ -32,6 +32,7 @@ export default function TaskCard({
   const isActive = task.status === 'in_progress';
   const isCompleted = task.status === 'completed';
   const isFailed = task.status === 'failed';
+  const isFinalPass = task.title === 'Final Research and Synthesis';
   const toolCalls = task.tool_calls || [];
 
   return (
@@ -42,6 +43,8 @@ export default function TaskCard({
           ? 'border-blue-500/30 bg-blue-500/5 shadow-md shadow-blue-500/5'
           : isFailed
           ? 'border-red-500/20 bg-red-500/5'
+          : isFinalPass
+          ? 'border-violet-500/20 bg-violet-500/[0.03]'
           : isCompleted
           ? 'border-emerald-500/10 bg-surface-800/30'
           : 'border-surface-700/30 bg-surface-800/20'
@@ -57,10 +60,12 @@ export default function TaskCard({
           className={`flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold ${
             isActive
               ? 'bg-blue-500/20 text-blue-400'
-              : isCompleted
-              ? 'bg-emerald-500/15 text-emerald-400'
               : isFailed
               ? 'bg-red-500/15 text-red-400'
+              : isFinalPass
+              ? 'bg-violet-500/15 text-violet-300'
+              : isCompleted
+              ? 'bg-emerald-500/15 text-emerald-400'
               : 'bg-surface-700/50 text-surface-400'
           }`}
         >
@@ -76,6 +81,12 @@ export default function TaskCard({
             >
               {task.title}
             </h4>
+            {isFinalPass && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-violet-400/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300">
+                <Sparkles size={9} />
+                Final pass
+              </span>
+            )}
           </div>
           <p className="text-xs text-surface-400 truncate mb-1">
             {task.description}

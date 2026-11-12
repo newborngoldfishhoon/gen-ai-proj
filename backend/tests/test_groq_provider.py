@@ -14,11 +14,21 @@ from app.services.llm_provider import GroqProvider, LLMStepResponse
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _response(body: dict, status: int = 200) -> httpx.Response:
+def _response(
+    body: dict,
+    status: int = 200,
+    headers: dict | None = None,
+) -> httpx.Response:
     """Build a minimal fake httpx.Response."""
+    response_headers = {
+        "content-type": "application/json",
+        "x-request-id": "test-req-id",
+    }
+    if headers:
+        response_headers.update(headers)
     return httpx.Response(
         status_code=status,
-        headers={"content-type": "application/json", "x-request-id": "test-req-id"},
+        headers=response_headers,
         content=json.dumps(body).encode(),
     )
 
@@ -58,21 +68,28 @@ def _error_response(msg: str, code: str = "tool_use_failed") -> dict:
 class _MockTransport(httpx.AsyncBaseTransport):
     """Replay a fixed sequence of responses."""
 
-    def __init__(self, responses: list[httpx.Response]):
+    def __init__(self, responses: list[httpx.Response | Exception]):
         self._queue = list(responses)
         self.requests: list[httpx.Request] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         assert self._queue, "Unexpected extra request made"
-        return self._queue.pop(0)
+        response = self._queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
-def _make_provider(responses: list[httpx.Response]) -> tuple[GroqProvider, _MockTransport]:
+def _make_provider(
+    responses: list[httpx.Response | Exception],
+) -> tuple[GroqProvider, _MockTransport]:
     transport = _MockTransport(responses)
     provider = GroqProvider.__new__(GroqProvider)
     provider._api_key = "test-key"
     provider._model = "openai/gpt-oss-120b"
+    provider._max_retries = 4
+    provider._retry_max_delay_seconds = 60
     provider._client = httpx.AsyncClient(
         base_url="https://api.groq.com/openai/v1",
         headers={"Authorization": "Bearer test-key"},
@@ -80,6 +97,71 @@ def _make_provider(responses: list[httpx.Response]) -> tuple[GroqProvider, _Mock
         timeout=10,
     )
     return provider, transport
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_after_server_hint(monkeypatch):
+    """A 429 waits as directed, then retries successfully."""
+    provider, transport = _make_provider([
+        _response(
+            _error_response("Rate limit reached", "rate_limit_exceeded"),
+            status=429,
+            headers={"retry-after": "0"},
+        ),
+        _response(_text_response("Recovered after rate limit")),
+    ])
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("app.services.llm_provider.asyncio.sleep", record_sleep)
+    result = await provider.generate("Try again")
+
+    assert result == "Recovered after rate limit"
+    assert len(transport.requests) == 2
+    assert delays == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_transient_server_error_retries_with_backoff(monkeypatch):
+    """A transient upstream 503 retries with bounded backoff."""
+    provider, transport = _make_provider([
+        _response(_error_response("Temporarily unavailable"), status=503),
+        _response(_text_response("Recovered after upstream error")),
+    ])
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("app.services.llm_provider.asyncio.sleep", record_sleep)
+    result = await provider.generate("Try again")
+
+    assert result == "Recovered after upstream error"
+    assert len(transport.requests) == 2
+    assert len(delays) == 1
+    assert 0 < delays[0] <= provider._retry_max_delay_seconds
+
+
+@pytest.mark.asyncio
+async def test_transient_network_error_retries(monkeypatch):
+    """A transient connection error retries instead of failing the task immediately."""
+    provider, transport = _make_provider([
+        httpx.ConnectError("temporary network failure"),
+        _response(_text_response("Recovered after network error")),
+    ])
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("app.services.llm_provider.asyncio.sleep", record_sleep)
+    result = await provider.generate("Try again")
+
+    assert result == "Recovered after network error"
+    assert len(transport.requests) == 2
+    assert len(delays) == 1
 
 
 TOOL_DECLS = [
@@ -236,6 +318,8 @@ async def test_provider_400_raises_with_details(caplog):
     import logging
     err_body = _error_response("Tool choice is none, but model called a tool", "tool_use_failed")
     provider, _ = _make_provider([
+        _response(err_body, status=400),
+        _response(err_body, status=400),
         _response(err_body, status=400),
         _response(err_body, status=400),
         _response(err_body, status=400),

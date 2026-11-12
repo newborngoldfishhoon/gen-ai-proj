@@ -18,6 +18,8 @@ import {
   Copy,
   Check,
   Download,
+  Layers3,
+  Sparkles,
 } from 'lucide-react';
 
 interface RunDetailProps {
@@ -150,10 +152,42 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
   }
 
   const completedCount = run.tasks.filter((t) => t.status === 'completed').length;
+  const activeCount = run.tasks.filter((t) => t.status === 'in_progress').length;
+  const finalPass = run.tasks.find((task) => task.title === 'Final Research and Synthesis');
+  const parallelTasks = run.tasks.filter(
+    (task) => task.title !== 'Final Research and Synthesis'
+  );
   const totalTasks = run.tasks.length;
   const progressPercent = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
   const toolCalls = run.tool_calls || [];
   const sources = run.sources || [];
+  const workflowPhase = finalPass?.status === 'in_progress'
+    ? {
+        title: 'Final research & synthesis',
+        description: 'The parallel findings are in. The final pass is checking for gaps and verifying important claims.',
+        icon: <Sparkles size={16} className="text-violet-300" />,
+        tone: 'border-violet-400/20 bg-violet-500/5',
+      }
+    : finalPass?.status === 'completed' || run.status === 'completed'
+    ? {
+        title: 'Research and synthesis complete',
+        description: 'All parallel tasks and the final research pass have finished.',
+        icon: <Check size={16} className="text-emerald-300" />,
+        tone: 'border-emerald-400/20 bg-emerald-500/5',
+      }
+    : activeCount > 0
+    ? {
+        title: `Researching in parallel · ${activeCount} active`,
+        description: 'Independent research tasks are running together. A final verification and synthesis pass follows.',
+        icon: <Layers3 size={16} className="text-blue-300" />,
+        tone: 'border-blue-400/20 bg-blue-500/5',
+      }
+    : {
+        title: 'Preparing parallel research',
+        description: 'Independent tasks are being planned. After they finish, a final pass will review and connect the findings.',
+        icon: <Layers3 size={16} className="text-brand-300" />,
+        tone: 'border-brand-400/20 bg-brand-500/5',
+      };
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -305,18 +339,58 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
       {/* Tab Panels */}
       {activeTab === 'tasks' && (
         <div className="space-y-2 animate-fade-in">
-          {run.tasks
+          {run.status === 'running' && (
+            <div className={`flex items-start gap-3 p-4 mb-4 rounded-xl border ${workflowPhase.tone}`}>
+              <div className="mt-0.5">{workflowPhase.icon}</div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-surface-100">{workflowPhase.title}</p>
+                <p className="mt-1 text-xs leading-relaxed text-surface-400">
+                  {workflowPhase.description}
+                </p>
+              </div>
+              {activeCount > 1 && (
+                <span className="ml-auto flex-shrink-0 rounded-full bg-blue-400/10 px-2.5 py-1 text-[11px] font-medium text-blue-200">
+                  {activeCount} simultaneous
+                </span>
+              )}
+            </div>
+          )}
+
+          {parallelTasks.length > 0 && (
+            <div className="flex items-center gap-2 px-1 pt-1 pb-2 text-xs font-semibold uppercase tracking-wider text-surface-400">
+              <Layers3 size={13} className="text-blue-300" />
+              Parallel Research
+              <span className="text-surface-600">({parallelTasks.length})</span>
+            </div>
+          )}
+          {parallelTasks
             .slice()
             .sort((a, b) => a.order_index - b.order_index)
-            .map((task, index) => (
+            .map((task) => (
               <TaskCard
                 key={task.id}
                 task={task}
-                index={index}
+                index={task.order_index}
                 isExpanded={expandedTasks.has(task.id)}
                 onToggle={() => toggleTask(task.id)}
               />
             ))}
+
+          {finalPass && (
+            <>
+              <div className="flex items-center gap-2 px-1 pt-4 pb-2 text-xs font-semibold uppercase tracking-wider text-surface-400">
+                <Sparkles size={13} className="text-violet-300" />
+                Final Pass
+              </div>
+              <TaskCard
+                key={finalPass.id}
+                task={finalPass}
+                index={finalPass.order_index}
+                isExpanded={expandedTasks.has(finalPass.id)}
+                onToggle={() => toggleTask(finalPass.id)}
+              />
+            </>
+          )}
         </div>
       )}
 

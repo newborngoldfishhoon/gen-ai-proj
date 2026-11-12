@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Groq AI
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_model: str = Field(default="openai/gpt-oss-120b", alias="GROQ_MODEL")
+    groq_max_concurrent_requests: int = Field(default=2, ge=1, alias="GROQ_MAX_CONCURRENT_REQUESTS")
+    groq_max_retries: int = Field(default=4, ge=0, le=8, alias="GROQ_MAX_RETRIES")
+    groq_retry_max_delay_seconds: float = Field(
+        default=60, gt=0, alias="GROQ_RETRY_MAX_DELAY_SECONDS"
+    )
 
     # App
     environment: str = Field(default="development", alias="ENVIRONMENT")
@@ -45,6 +50,7 @@ class Settings(BaseSettings):
 
     # Agent and Tool limits
     max_tasks: int = Field(default=6, alias="MAX_TASKS")
+    max_concurrent_tasks: int = Field(default=6, ge=1, alias="MAX_CONCURRENT_TASKS")
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     max_goal_length: int = Field(default=2000, alias="MAX_GOAL_LENGTH")
     max_search_results: int = Field(default=5, alias="MAX_SEARCH_RESULTS")
