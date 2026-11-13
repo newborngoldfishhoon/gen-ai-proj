@@ -75,7 +75,6 @@ class Orchestrator:
             settings = get_settings()
             session_lock = asyncio.Lock()
             parallel_tool_budget = RunToolBudget(settings.max_tool_calls_per_run)
-            run_seen_urls: set[str] = set()
             task_semaphore = asyncio.Semaphore(
                 min(settings.max_concurrent_tasks, len(tasks))
             )
@@ -90,7 +89,6 @@ class Orchestrator:
                         session=session,
                         session_lock=session_lock,
                         tool_budget=parallel_tool_budget,
-                        run_seen_urls=run_seen_urls,
                         fast_mode=True,
                     )
 
@@ -119,11 +117,12 @@ class Orchestrator:
                     })
                     continue
 
-                completed_results.append({
-                    "title": task.title,
-                    "result": result,
-                })
-                all_sources.extend(task_sources)
+                if task.title != "Resource research":
+                    completed_results.append({
+                        "title": task.title,
+                        "result": result,
+                    })
+                    all_sources.extend(task_sources)
 
             await session.commit()
 

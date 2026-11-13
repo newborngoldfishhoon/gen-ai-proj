@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import type { RunListItem } from './types/agent';
 import api from './services/api';
 import GoalInput from './components/GoalInput';
@@ -14,15 +14,16 @@ export default function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingRuns, setIsLoadingRuns] = useState(true);
   const [error, setError] = useState('');
+  const hasLoadedRuns = useRef(false);
 
   const fetchRuns = useCallback(async () => {
     try {
       const data = await api.listRuns(20, 0);
       setRuns(data.runs);
+      hasLoadedRuns.current = true;
       setError('');
     } catch (err) {
-      // Only show error if we have no runs cached
-      if (runs.length === 0) {
+      if (!hasLoadedRuns.current) {
         setError(
           err instanceof Error
             ? err.message

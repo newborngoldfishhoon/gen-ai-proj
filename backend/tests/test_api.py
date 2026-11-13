@@ -107,6 +107,59 @@ async def test_list_runs_empty(client):
 
 
 @pytest.mark.asyncio
+async def test_export_completed_run_as_pdf(client, monkeypatch):
+    import app.api.routes as routes
+    from uuid import UUID
+    from app.models.agent import AgentRun, RunStatus
+
+    async def render_pdf(html):
+        assert "<h1>Research Report</h1>" in html
+        return b"%PDF-1.7 test document"
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "render_report_pdf", render_pdf)
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    created = await client.post("/api/runs", json={"goal": "PDF export test"})
+    run_id = created.json()["id"]
+    async with client.test_session_factory() as session:
+        run = await session.get(AgentRun, UUID(run_id))
+        assert run is not None
+        run.status = RunStatus.COMPLETED
+        run.final_report = "# Research Report\n\nTest content."
+        await session.commit()
+
+    response = await client.post(
+        f"/api/runs/{run_id}/pdf",
+        json={"html": "<h1>Research Report</h1>"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].endswith(f'{run_id}.pdf"')
+    assert response.content.startswith(b"%PDF-")
+
+
+@pytest.mark.asyncio
+async def test_export_pdf_requires_completed_report(client, monkeypatch):
+    import app.api.routes as routes
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    created = await client.post("/api/runs", json={"goal": "PDF export state test"})
+
+    response = await client.post(
+        f"/api/runs/{created.json()['id']}/pdf",
+        json={"html": "<h1>Research Report</h1>"},
+    )
+
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_get_run_not_found(client):
     """Test 404 for unknown run ID."""
     import uuid
@@ -155,6 +208,61 @@ async def test_retry_rejects_non_failed_run(client):
 
     assert retried.status_code == 409
     assert retried.json()["detail"] == "Only failed runs can be retried."
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_marks_abandoned_work_failed(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from uuid import UUID
+    from sqlalchemy import select
+    import app.api.routes as routes
+    from app.models.agent import AgentRun, AgentTask, RunStatus, TaskStatus
+
+    monkeypatch.setattr(routes, "get_session_factory", lambda: client.test_session_factory)
+    monkeypatch.setattr(
+        routes,
+        "get_settings",
+        lambda: type("Settings", (), {"agent_run_timeout_seconds": 35})(),
+    )
+
+    stale_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    async with client.test_session_factory() as session:
+        run = AgentRun(
+            goal="Recover abandoned run",
+            status=RunStatus.RUNNING,
+            created_at=stale_time,
+            updated_at=stale_time,
+        )
+        session.add(run)
+        await session.commit()
+        await session.refresh(run)
+        run_id = run.id
+        task = AgentTask(
+            run_id=run_id,
+            title="Pending task",
+            description="A task interrupted by restart",
+            order_index=0,
+            status=TaskStatus.IN_PROGRESS,
+            created_at=stale_time,
+            updated_at=stale_time,
+        )
+        session.add(task)
+        await session.commit()
+
+    recovered_count = await routes.recover_stale_runs()
+
+    async with client.test_session_factory() as session:
+        recovered = await session.get(AgentRun, run_id)
+        assert recovered is not None
+        assert recovered.status == RunStatus.FAILED
+        assert "Retry the run" in recovered.error_message
+        assert recovered.completed_at is not None
+        tasks = await session.execute(
+            select(AgentTask).where(AgentTask.run_id == run_id)
+        )
+        assert tasks.scalar_one().status == TaskStatus.FAILED
+    assert recovered_count == 1
 
 
 @pytest.mark.asyncio

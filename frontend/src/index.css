@@ -175,6 +175,11 @@
   .report-paper tbody tr:nth-child(even) {
     @apply bg-slate-50;
   }
+  .resource-guide > header h2 {
+    margin: 0.25rem 0 0;
+    border: 0;
+    padding: 0;
+  }
 }
 
 /* Shimmer loading animation */

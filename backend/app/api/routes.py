@@ -2,18 +2,20 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from playwright.async_api import Error as PlaywrightError
 
 from app.db.session import get_db, get_session_factory
 from app.models.agent import AgentRun, AgentTask, RunStatus, TaskStatus, ToolCall, Source
 from app.schemas.agent import (
     ErrorResponse,
+    PdfExportRequest,
     RunCreateRequest,
     RunCreatedResponse,
     RunListItem,
@@ -25,10 +27,47 @@ from app.schemas.agent import (
 from app.services.llm_provider import create_llm_provider
 from app.agent.orchestrator import Orchestrator
 from app.core.config import get_settings
+from app.services.pdf_export import render_report_pdf
 
 logger = logging.getLogger("agentforge.api")
 
 router = APIRouter(prefix="/api", tags=["agent"])
+
+
+async def recover_stale_runs() -> int:
+    """Fail runs left active after their in-process background worker disappeared."""
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(seconds=settings.agent_run_timeout_seconds * 2)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(AgentRun)
+            .options(selectinload(AgentRun.tasks))
+            .where(
+                AgentRun.status.in_([RunStatus.PLANNING, RunStatus.RUNNING]),
+                AgentRun.updated_at < stale_before,
+            )
+        )
+        stale_runs = result.scalars().all()
+        for run in stale_runs:
+            run.status = RunStatus.FAILED
+            run.error_message = (
+                "This run stopped responding before it completed. "
+                "Retry the run to start a fresh attempt."
+            )
+            run.completed_at = now
+            session.add(run)
+            for task in run.tasks:
+                if task.status in {TaskStatus.PENDING, TaskStatus.IN_PROGRESS}:
+                    task.status = TaskStatus.FAILED
+                    task.error_message = run.error_message
+                    task.completed_at = now
+                    session.add(task)
+        if stale_runs:
+            await session.commit()
+            logger.warning("Recovered %d stale agent run(s)", len(stale_runs))
+        return len(stale_runs)
 
 
 @router.post(
@@ -184,41 +223,117 @@ async def list_runs(
     count_result = await session.execute(select(func.count(AgentRun.id)))
     total = count_result.scalar() or 0
 
-    result = await session.execute(
-        select(AgentRun)
-        .options(
-            selectinload(AgentRun.tasks),
-            selectinload(AgentRun.tool_calls),
-            selectinload(AgentRun.sources),
+    task_counts = (
+        select(
+            AgentTask.run_id.label("run_id"),
+            func.count(AgentTask.id).label("task_count"),
+            func.count(AgentTask.id)
+            .filter(AgentTask.status == TaskStatus.COMPLETED)
+            .label("completed_task_count"),
         )
+        .group_by(AgentTask.run_id)
+        .subquery()
+    )
+    tool_counts = (
+        select(
+            ToolCall.run_id.label("run_id"),
+            func.count(ToolCall.id).label("tool_call_count"),
+        )
+        .group_by(ToolCall.run_id)
+        .subquery()
+    )
+    source_counts = (
+        select(
+            Source.run_id.label("run_id"),
+            func.count(Source.id).label("source_count"),
+        )
+        .group_by(Source.run_id)
+        .subquery()
+    )
+    result = await session.execute(
+        select(
+            AgentRun.id,
+            AgentRun.goal,
+            AgentRun.status,
+            AgentRun.created_at,
+            AgentRun.updated_at,
+            AgentRun.completed_at,
+            func.coalesce(task_counts.c.task_count, 0).label("task_count"),
+            func.coalesce(
+                task_counts.c.completed_task_count, 0
+            ).label("completed_task_count"),
+            func.coalesce(tool_counts.c.tool_call_count, 0).label(
+                "tool_call_count"
+            ),
+            func.coalesce(source_counts.c.source_count, 0).label("source_count"),
+        )
+        .outerjoin(task_counts, task_counts.c.run_id == AgentRun.id)
+        .outerjoin(tool_counts, tool_counts.c.run_id == AgentRun.id)
+        .outerjoin(source_counts, source_counts.c.run_id == AgentRun.id)
         .order_by(AgentRun.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
-    runs = result.scalars().all()
-
-    items = []
-    for run in runs:
-        task_count = len(run.tasks)
-        completed_count = sum(
-            1 for t in run.tasks if t.status == TaskStatus.COMPLETED
+    items = [
+        RunListItem(
+            id=run.id,
+            goal=run.goal,
+            status=run.status.value,
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+            completed_at=run.completed_at,
+            task_count=run.task_count,
+            completed_task_count=run.completed_task_count,
+            tool_call_count=run.tool_call_count,
+            source_count=run.source_count,
         )
-        items.append(
-            RunListItem(
-                id=run.id,
-                goal=run.goal,
-                status=run.status.value,
-                created_at=run.created_at,
-                updated_at=run.updated_at,
-                completed_at=run.completed_at,
-                task_count=task_count,
-                completed_task_count=completed_count,
-                tool_call_count=len(run.tool_calls),
-                source_count=len(run.sources),
-            )
-        )
+        for run in result.all()
+    ]
 
     return RunListResponse(runs=items, total=total)
+
+
+@router.post(
+    "/runs/{run_id}/pdf",
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    summary="Export a completed report as PDF",
+    description="Render the browser-styled report using Chromium's print engine.",
+)
+async def export_run_pdf(
+    run_id: UUID,
+    request: PdfExportRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    """Render the report's existing browser markup to an A4 PDF."""
+    run = await session.get(AgentRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if run.status != RunStatus.COMPLETED or not run.final_report:
+        raise HTTPException(
+            status_code=409,
+            detail="Only completed runs with a final report can be exported.",
+        )
+
+    try:
+        pdf = await render_report_pdf(request.html)
+    except PlaywrightError as error:
+        logger.exception("PDF rendering failed for run %s", run_id)
+        raise HTTPException(
+            status_code=503,
+            detail="PDF rendering failed. Check that the backend Chromium installation is available.",
+        ) from error
+
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="agentforge-report-{run_id}.pdf"'
+        },
+    )
 
 
 @router.get(

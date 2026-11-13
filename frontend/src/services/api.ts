@@ -12,6 +12,8 @@ import type {
 } from '../types/agent';
 
 const API_BASE = '/api';
+const REQUEST_TIMEOUT_MS = 15_000;
+const PDF_EXPORT_TIMEOUT_MS = 60_000;
 
 class ApiError extends Error {
   status: number;
@@ -27,6 +29,11 @@ async function request<T>(
   options?: RequestInit
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    REQUEST_TIMEOUT_MS
+  );
 
   try {
     const response = await fetch(url, {
@@ -35,6 +42,7 @@ async function request<T>(
         ...options?.headers,
       },
       ...options,
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -51,10 +59,18 @@ async function request<T>(
     return await response.json();
   } catch (error) {
     if (error instanceof ApiError) throw error;
+    if (controller.signal.aborted) {
+      throw new ApiError(
+        'The backend did not respond in time. Check that it is running, then try again.',
+        0
+      );
+    }
     throw new ApiError(
       error instanceof Error ? error.message : 'Network error',
       0
     );
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
@@ -98,6 +114,48 @@ export const api = {
   /** Get recorded sources for a run */
   getRunSources(runId: string): Promise<Source[]> {
     return request<Source[]>(`/runs/${runId}/sources`);
+  },
+
+  /** Render the browser-styled report as a PDF through the backend. */
+  async exportRunPdf(runId: string, html: string): Promise<Blob> {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(
+      () => controller.abort(),
+      PDF_EXPORT_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(`${API_BASE}/runs/${runId}/pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ html }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        let detail = `PDF export failed with status ${response.status}`;
+        try {
+          const body = await response.json();
+          detail = body.detail || detail;
+        } catch {
+          // Keep the HTTP status message if the server response is not JSON.
+        }
+        throw new ApiError(detail, response.status);
+      }
+      if (!response.headers.get('content-type')?.includes('application/pdf')) {
+        throw new ApiError('The backend did not return a PDF document.', response.status);
+      }
+      return await response.blob();
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (controller.signal.aborted) {
+        throw new ApiError('PDF export timed out. Please try again.', 0);
+      }
+      throw new ApiError(
+        error instanceof Error ? error.message : 'PDF export failed.',
+        0,
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
   },
 };
 

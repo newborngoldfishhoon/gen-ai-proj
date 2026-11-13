@@ -21,6 +21,12 @@ class RunCreateRequest(BaseModel):
     )
 
 
+class PdfExportRequest(BaseModel):
+    """Browser-rendered report markup submitted for Chromium PDF export."""
+
+    html: str = Field(..., min_length=1, max_length=2_000_000)
+
+
 # ── Tool & Source Responses ──────────────────────────────────────────────
 
 

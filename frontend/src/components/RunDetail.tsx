@@ -5,9 +5,11 @@ import StatusBadge from './StatusBadge';
 import TaskCard from './TaskCard';
 import ToolTimeline from './ToolTimeline';
 import SourcePanel from './SourcePanel';
+import ResourcePanel from './ResourcePanel';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { getCategory, type ResourceCategory } from './ResourcePanel';
 import {
   ArrowLeft,
   FileText,
@@ -23,6 +25,7 @@ import {
   Layers3,
   Sparkles,
   RefreshCw,
+  Compass,
 } from 'lucide-react';
 
 interface RunDetailProps {
@@ -31,20 +34,37 @@ interface RunDetailProps {
   onRetry: (runId: string) => void;
 }
 
-type TabType = 'tasks' | 'timeline' | 'sources' | 'report';
-type ExportFormat = 'markdown' | 'text' | 'html' | 'pdf';
+type TabType = 'tasks' | 'timeline' | 'sources' | 'resources' | 'report';
+type ExportFormat = 'pdf' | 'markdown' | 'text' | 'html';
 
-function createReportHtml(title: string, report: string): string {
-  const body = renderToStaticMarkup(
-    <ReactMarkdown remarkPlugins={[remarkGfm]}>{report}</ReactMarkdown>
-  );
-  const escapedTitle = title.replace(/[&<>"']/g, (character) => ({
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, (character) => ({
     '&': '&amp;',
     '<': '&lt;',
     '>': '&gt;',
     '"': '&quot;',
     "'": '&#39;',
   })[character] || character);
+}
+
+function getResourceSummary(source: AgentRun['sources'][number]): string {
+  const summary = source.snippet?.trim().replace(/\s+/g, ' ');
+  if (!summary) return 'The search result did not provide a summary for this link.';
+  return summary.length > 220 ? `${summary.slice(0, 217).trimEnd()}...` : summary;
+}
+
+function createReportHtml(title: string, report: string, resources: AgentRun['sources']): string {
+  const reportBody = renderToStaticMarkup(
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      {report}
+    </ReactMarkdown>
+  );
+  const guideBody = renderToStaticMarkup(
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      {createKickstartMarkdown(resources)}
+    </ReactMarkdown>
+  );
+  const escapedTitle = escapeHtml(title);
 
   return `<!doctype html>
 <html lang="en">
@@ -53,17 +73,19 @@ function createReportHtml(title: string, report: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapedTitle}</title>
   <style>
-    :root { color-scheme: light; font-family: Inter, Arial, sans-serif; color: #172033; background: #fff; }
+    :root { color-scheme: light; font-family: Arial, sans-serif; color: #172033; background: #fff; }
     body { margin: 0; padding: 48px 24px; }
     main { max-width: 820px; margin: 0 auto; }
+    section { width: 100%; }
+    .kickstart { break-before: page; page-break-before: always; }
     h1 { font-size: 30px; line-height: 1.2; margin: 0 0 24px; letter-spacing: -.03em; }
     h2 { font-size: 20px; margin: 28px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #e5e7eb; }
     h3 { font-size: 16px; margin: 20px 0 8px; }
     p, li { font-size: 14px; line-height: 1.65; }
     ul, ol { padding-left: 22px; }
     a { color: #175cd3; overflow-wrap: anywhere; }
-    table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
-    th, td { border: 1px solid #d0d5dd; padding: 8px 10px; text-align: left; vertical-align: top; }
+    table { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
+    th, td { border: 1px solid #d0d5dd; padding: 8px 10px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
     th { background: #f2f4f7; }
     blockquote { margin: 16px 0; padding: 4px 14px; border-left: 3px solid #98a2b3; color: #475467; }
     code { font-family: Consolas, monospace; background: #f2f4f7; padding: 2px 4px; }
@@ -72,7 +94,177 @@ function createReportHtml(title: string, report: string): string {
     @media print { body { padding: 0; } a { color: #175cd3; text-decoration: none; } h2, h3 { break-after: avoid; } table, blockquote { break-inside: avoid; } }
   </style>
 </head>
-<body><main>${body}</main></body>
+<body><main><section class="report-content">${reportBody}</section><section class="kickstart">${guideBody}</section></main></body>
+</html>`;
+}
+
+function createKickstartMarkdown(resources: AgentRun['sources']): string {
+  const validResources = resources.filter((source) => /^https?:\/\//i.test(source.url));
+  const grouped = new Map<ResourceCategory, AgentRun['sources']>();
+  for (const resource of validResources) {
+    const category = getCategory(resource);
+    grouped.set(category, [...(grouped.get(category) || []), resource]);
+  }
+  const sections = [...grouped.entries()].map(([category, items]) => [
+    `## ${category}`,
+    '',
+    ...items.flatMap((source) => [
+      `### [${source.title.replace(/[\\`*_{}[\]()#+.!|>~-]/g, '\\$&')}](${source.url})`,
+      '',
+      getResourceSummary(source),
+      '',
+    ]),
+  ].join('\n'));
+  const resourcesContent = sections.length ? sections.join('\n') : 'No resource links were found for this run.';
+  return `# Kickstart Guide\n\nCurated tutorials, courses, opportunities, and useful links related to this research.\n\n${resourcesContent}`;
+}
+
+function createCombinedMarkdown(report: string, resources: AgentRun['sources']): string {
+  return `${report}\n\n---\n\n${createKickstartMarkdown(resources)}`;
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function createEmbeddedFontStyles(report: HTMLElement, guide: HTMLElement): Promise<string> {
+  const fontLinks = Array.from(
+    document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]'),
+  )
+    .map((link) => link.href)
+    .filter((href) => new URL(href).hostname === 'fonts.googleapis.com');
+  const text = [...new Set(`${report.textContent || ''}${guide.textContent || ''}`)].join('');
+
+  const fontStyles = await Promise.all(fontLinks.map(async (href) => {
+    const url = new URL(href);
+    url.searchParams.set('text', text);
+    const cssResponse = await fetch(url);
+    if (!cssResponse.ok) throw new Error('Could not load the report fonts for PDF export.');
+    let css = await cssResponse.text();
+    const fontUrls = [...new Set(
+      Array.from(css.matchAll(/url\((https:\/\/fonts\.gstatic\.com\/[^)]+)\)/g), (match) => match[1]),
+    )];
+    for (const fontUrl of fontUrls) {
+      const fontResponse = await fetch(fontUrl);
+      if (!fontResponse.ok) throw new Error('Could not load the report fonts for PDF export.');
+      const fontBytes = new Uint8Array(await fontResponse.arrayBuffer());
+      const dataUrl = `data:font/woff2;base64,${encodeBase64(fontBytes)}`;
+      css = css.split(fontUrl).join(dataUrl);
+    }
+    return css;
+  }));
+  return fontStyles.join('\n');
+}
+
+async function inlineReportImages(...elements: HTMLElement[]): Promise<void> {
+  const images = elements.flatMap((element) =>
+    Array.from(element.querySelectorAll<HTMLImageElement>('img[src]')),
+  );
+  await Promise.all(images.map(async (image) => {
+    const source = image.currentSrc || image.src;
+    if (source.startsWith('data:')) return;
+    const response = await fetch(source);
+    if (!response.ok) throw new Error('Could not load a report image for PDF export.');
+    const imageBlob = await response.blob();
+    if (!imageBlob.type.startsWith('image/')) {
+      throw new Error('A report image has an unsupported format for PDF export.');
+    }
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') resolve(reader.result);
+        else reject(new Error('Could not embed a report image for PDF export.'));
+      };
+      reader.onerror = () => reject(new Error('Could not embed a report image for PDF export.'));
+      reader.readAsDataURL(imageBlob);
+    });
+    image.src = dataUrl;
+    image.removeAttribute('srcset');
+    image.removeAttribute('sizes');
+    image.loading = 'eager';
+    await image.decode();
+  }));
+}
+
+async function createPdfExportHtml(): Promise<string> {
+  await document.fonts.ready;
+  const reportElement = document.querySelector<HTMLElement>('[data-pdf-export-report]');
+  const guideElement = document.querySelector<HTMLElement>('[data-pdf-export-guide]');
+  if (!reportElement || !guideElement) {
+    throw new Error('Open the Final Report tab before exporting the PDF.');
+  }
+
+  const report = reportElement.cloneNode(true) as HTMLElement;
+  report.querySelector('[data-pdf-export-toolbar]')?.remove();
+  report.querySelector('[role="alert"]')?.remove();
+  const guide = guideElement.cloneNode(true) as HTMLElement;
+  await inlineReportImages(report, guide);
+  const fontStyles = await createEmbeddedFontStyles(report, guide);
+
+  const styles: string[] = [];
+  for (const sheet of Array.from(document.styleSheets)) {
+    const host = sheet.href ? new URL(sheet.href).hostname : '';
+    if (host === 'fonts.googleapis.com') continue;
+    try {
+      styles.push(Array.from(sheet.cssRules, (rule) => rule.cssText).join('\n'));
+    } catch {
+      throw new Error('Could not prepare the report styles for PDF export.');
+    }
+  }
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    ${fontStyles}
+    ${styles.join('\n')}
+    @page { size: A4; margin: 14mm 14mm 18mm; }
+    *, *::before, *::after {
+      animation: none !important;
+      transition: none !important;
+      scroll-behavior: auto !important;
+    }
+    html, body { min-height: 0; margin: 0; background: #fff !important; }
+    body { font-family: Inter, system-ui, sans-serif; color: #172033; }
+    .pdf-document { width: 100%; max-width: 896px; margin: 0 auto; }
+    .report-card { overflow: visible !important; }
+    .report-paper, .resource-guide {
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+    }
+    .resource-guide { break-before: page; page-break-before: always; }
+    .markdown-content table {
+      display: table !important;
+      width: 100% !important;
+      table-layout: fixed;
+      overflow: visible !important;
+      border-collapse: collapse;
+    }
+    .markdown-content th, .markdown-content td { overflow-wrap: anywhere; }
+    .markdown-content thead { display: table-header-group; }
+    .markdown-content tr, .resource-link-card, .resource-guide > header,
+    .markdown-content blockquote, .markdown-content pre {
+      break-inside: avoid-page;
+      page-break-inside: avoid;
+    }
+    .report-paper h1, .report-paper h2, .report-paper h3 {
+      break-after: avoid-page;
+      page-break-after: avoid;
+    }
+    img, svg { max-width: 100%; }
+    a { color: #175cd3; }
+  </style>
+</head>
+<body class="pdf-export">
+  <main class="pdf-document">${report.outerHTML}${guide.outerHTML}</main>
+</body>
 </html>`;
 }
 
@@ -100,8 +292,13 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState('');
   const [exportError, setExportError] = useState('');
-  const [exportFormat, setExportFormat] = useState<ExportFormat>('markdown');
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('pdf');
   const pollRef = useRef<number | null>(null);
+  const exportResourceTask = run?.tasks.find((task) => task.title === 'Resource research');
+  const exportResources = exportResourceTask
+    ? run?.sources.filter((source) => source.task_id === exportResourceTask.id) || []
+    : [];
 
   const fetchRun = useCallback(async () => {
     try {
@@ -160,32 +357,39 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
     }
   };
 
-  const handleDownloadReport = () => {
+  const handleDownloadReport = async () => {
     if (!run?.final_report) return;
     const safeGoal = run.goal.slice(0, 60).replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim();
     const baseName = `agentforge-report-${safeGoal || run.id.slice(0, 8)}`;
+    const combinedMarkdown = createCombinedMarkdown(run.final_report, exportResources);
+    setExportError('');
     if (exportFormat === 'pdf') {
-      setExportError('');
-      const printWindow = window.open('', '_blank');
-      if (!printWindow) {
-        setExportError('Allow pop-ups to print or save the report as a PDF.');
-        return;
+      if (isExportingPdf) return;
+      setIsExportingPdf(true);
+      try {
+        const html = await createPdfExportHtml();
+        const blob = await api.exportRunPdf(run.id, html);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${baseName}.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (err) {
+        setExportError(err instanceof Error ? `PDF export failed: ${err.message}` : 'PDF export failed.');
+      } finally {
+        setIsExportingPdf(false);
       }
-      printWindow.document.open();
-      printWindow.document.write(createReportHtml(baseName, run.final_report));
-      printWindow.document.close();
-      window.setTimeout(() => {
-        printWindow.focus();
-        printWindow.print();
-      }, 250);
       return;
     }
 
-    const html = createReportHtml(baseName, run.final_report);
+    const html = createReportHtml(baseName, run.final_report, exportResources);
     const content = exportFormat === 'markdown'
-      ? run.final_report
+      ? combinedMarkdown
       : exportFormat === 'text'
-      ? run.final_report
+      ? combinedMarkdown
           .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
           .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
           .replace(/^#{1,6}\s+/gm, '')
@@ -260,6 +464,9 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
   const progressPercent = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
   const toolCalls = run.tool_calls || [];
   const sources = run.sources || [];
+  const uniqueSources = [...new Map(sources.map((source) => [source.url, source])).values()];
+  const resourceTask = exportResourceTask;
+  const resourceSources = exportResources;
   const workflowPhase = finalPass?.status === 'in_progress'
     ? {
         title: 'Formatting report',
@@ -269,21 +476,21 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
       }
     : finalPass?.status === 'completed' || run.status === 'completed'
     ? {
-        title: 'Fast research complete',
-        description: 'The research answer and source list are ready.',
+        title: 'Research complete',
+        description: 'Your research answer and practical resource links are ready.',
         icon: <Check size={16} className="text-emerald-300" />,
         tone: 'border-emerald-400/20 bg-emerald-500/5',
       }
     : activeCount > 0
     ? {
         title: 'Researching',
-        description: 'One focused research task is running with a single search to return results faster.',
+        description: 'The answer research and resource search are running in parallel.',
         icon: <Layers3 size={16} className="text-blue-300" />,
         tone: 'border-blue-400/20 bg-blue-500/5',
       }
     : {
-        title: 'Starting fast research',
-        description: 'Preparing one focused research task; the answer and source list are formatted without extra synthesis.',
+        title: 'Starting research',
+        description: 'Preparing the answer and a separate search for tutorials, courses, and useful links.',
         icon: <Layers3 size={16} className="text-brand-300" />,
         tone: 'border-brand-400/20 bg-brand-500/5',
       };
@@ -348,7 +555,7 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
               Sources Verified
             </span>
             <span className="text-lg font-bold text-emerald-400">
-              {sources.length}
+              {uniqueSources.length}
             </span>
           </div>
         </div>
@@ -435,8 +642,22 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
           }`}
         >
           <Globe size={16} />
-          Sources ({sources.length})
+          Sources ({uniqueSources.length})
         </button>
+
+        {resourceTask && (
+          <button
+            onClick={() => setActiveTab('resources')}
+            className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
+              activeTab === 'resources'
+                ? 'border-brand-500 text-brand-300'
+                : 'border-transparent text-surface-400 hover:text-surface-200'
+            }`}
+          >
+            <Compass size={16} />
+            Kickstart ({resourceSources.length})
+          </button>
+        )}
 
         {run.final_report && (
           <button
@@ -516,12 +737,16 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
       )}
 
       {activeTab === 'sources' && (
-        <SourcePanel sources={sources} />
+        <SourcePanel sources={uniqueSources} />
+      )}
+
+      {activeTab === 'resources' && resourceTask && (
+        <ResourcePanel sources={resourceSources} taskStatus={resourceTask.status} />
       )}
 
       {activeTab === 'report' && run.final_report && (
-        <div className="report-card overflow-hidden animate-fade-in">
-          <div className="p-4 bg-surface-800/80 border-b border-surface-700/40 flex items-center justify-between gap-3">
+        <div className="report-card overflow-hidden animate-fade-in" data-pdf-export-report>
+          <div className="p-4 bg-surface-800/80 border-b border-surface-700/40 flex items-center justify-between gap-3" data-pdf-export-toolbar>
             <div className="flex items-center gap-2">
               <FileText size={18} className="text-brand-400" />
               <h3 className="text-base font-semibold text-surface-100">
@@ -555,18 +780,19 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
                 onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
                 className="rounded-lg border border-surface-600/50 bg-surface-700/50 px-2.5 py-1.5 text-xs text-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-500/40"
               >
+                <option value="pdf">PDF document</option>
                 <option value="markdown">Markdown</option>
                 <option value="text">Plain text</option>
                 <option value="html">HTML</option>
-                <option value="pdf">PDF / Print</option>
               </select>
               <button
                 onClick={handleDownloadReport}
-                className="btn-secondary text-xs py-1.5 px-3"
-                title={exportFormat === 'pdf' ? 'Print or save the report as a PDF' : `Download ${exportFormat} report`}
+                className="btn-primary text-xs py-1.5 px-3"
+                title={exportFormat === 'pdf' ? 'Download the complete report as a PDF' : `Download ${exportFormat} report`}
+                disabled={exportFormat === 'pdf' && isExportingPdf}
               >
-                <Download size={14} />
-                {exportFormat === 'pdf' ? 'Print / PDF' : 'Export'}
+                {isExportingPdf ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />}
+                {isExportingPdf ? 'Preparing PDF…' : exportFormat === 'pdf' ? 'Export PDF' : `Export ${exportFormat.toUpperCase()}`}
               </button>
             </div>
           </div>
@@ -592,6 +818,14 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
             </ReactMarkdown>
           </div>
         </div>
+      )}
+      {activeTab === 'report' && run.final_report && resourceTask && (
+        <ResourcePanel
+          sources={resourceSources}
+          taskStatus={resourceTask.status}
+          printable
+          exportTarget
+        />
       )}
     </div>
   );

@@ -6,14 +6,17 @@ from app.agent.planner import Planner, ExecutionPlan
 
 
 @pytest.mark.asyncio
-async def test_create_plan_uses_one_fast_task_without_calling_llm():
-    """A fast plan must not spend an LLM request planning work."""
+async def test_create_plan_adds_answer_and_resource_tasks_without_llm():
+    """The fast plan includes the main answer and a separate resource search."""
     planner = Planner()
     plan = await planner.create_plan("Research AI trends")
 
     assert isinstance(plan, ExecutionPlan)
-    assert len(plan.tasks) == 1
+    assert len(plan.tasks) == 2
     assert plan.tasks[0].description == "Research AI trends"
+    assert plan.tasks[1].title == "Resource research"
+    assert "tutorial videos and courses" in plan.tasks[1].description
+    assert "official application links" in plan.tasks[1].description
     for task in plan.tasks:
         assert task.title
         assert task.description

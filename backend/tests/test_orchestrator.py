@@ -46,10 +46,19 @@ async def test_full_orchestration_success(mock_llm, db_session):
 
     # Check tasks
     tasks = run.tasks
-    assert len(tasks) >= 1
+    assert len(tasks) >= 3
     for task in tasks:
         assert task.status == TaskStatus.COMPLETED
         assert task.result is not None
+    resource_task = next(task for task in tasks if task.title == "Resource research")
+    assert "# Kickstart Resources" in resource_task.result
+    assert "Kickstart Resources" not in run.final_report
+    from sqlalchemy import select
+    from app.models.agent import Source
+    resource_sources = await db_session.execute(
+        select(Source).where(Source.task_id == resource_task.id)
+    )
+    assert resource_sources.scalars().all()
 
 
 @pytest.mark.asyncio

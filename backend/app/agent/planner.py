@@ -27,13 +27,13 @@ class ExecutionPlan(BaseModel):
 
 
 class Planner:
-    """Creates one focused research task without a separate planning model call."""
+    """Creates focused research and resource tasks without a planning model call."""
 
     def __init__(self):
         self._settings = get_settings()
 
     async def create_plan(self, goal: str) -> ExecutionPlan:
-        """Create a single-task plan directly from the validated user goal."""
+        """Create the answer and practical-resource tasks directly from the goal."""
         if not goal or not goal.strip():
             raise ValueError("Goal cannot be empty")
 
@@ -46,5 +46,15 @@ class Planner:
             PlannedTask(
                 title="Research and answer the goal",
                 description=goal.strip(),
-            )
+            ),
+            PlannedTask(
+                title="Resource research",
+                description=(
+                    "Find practical resources related to the goal, prioritizing useful "
+                    "tutorial videos and courses. For job or career goals, prioritize "
+                    "current openings and official application links. Include relevant "
+                    "trending or up-to-date resources. Use credible, directly useful links "
+                    "and summarize each in 1-2 lines. Do not invent URLs or availability."
+                ),
+            ),
         ])

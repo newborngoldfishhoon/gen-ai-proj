@@ -49,13 +49,13 @@ class Settings(BaseSettings):
     agent_enable_calculator: bool = Field(default=True, alias="AGENT_ENABLE_CALCULATOR")
 
     # Agent and Tool limits
-    max_tasks: int = Field(default=1, ge=1, alias="MAX_TASKS")
-    max_concurrent_tasks: int = Field(default=1, ge=1, alias="MAX_CONCURRENT_TASKS")
+    max_tasks: int = Field(default=2, ge=1, alias="MAX_TASKS")
+    max_concurrent_tasks: int = Field(default=2, ge=1, alias="MAX_CONCURRENT_TASKS")
     max_retries: int = Field(default=1, ge=1, alias="MAX_RETRIES")
     max_goal_length: int = Field(default=2000, alias="MAX_GOAL_LENGTH")
-    max_search_results: int = Field(default=1, ge=1, le=10, alias="MAX_SEARCH_RESULTS")
+    max_search_results: int = Field(default=5, ge=1, le=10, alias="MAX_SEARCH_RESULTS")
     max_tool_calls_per_task: int = Field(default=1, alias="MAX_TOOL_CALLS_PER_TASK")
-    max_tool_calls_per_run: int = Field(default=1, alias="MAX_TOOL_CALLS_PER_RUN")
+    max_tool_calls_per_run: int = Field(default=2, alias="MAX_TOOL_CALLS_PER_RUN")
     tool_timeout_seconds: int = Field(default=8, ge=1, alias="TOOL_TIMEOUT_SECONDS")
     agent_run_timeout_seconds: int = Field(default=35, ge=5, alias="AGENT_RUN_TIMEOUT_SECONDS")
     max_extracted_chars: int = Field(default=8000, alias="MAX_EXTRACTED_CHARS")

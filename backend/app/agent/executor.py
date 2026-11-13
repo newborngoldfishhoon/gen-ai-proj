@@ -89,7 +89,6 @@ class Executor:
         run_total_tools: int = 0,
         session_lock: asyncio.Lock | None = None,
         tool_budget: RunToolBudget | None = None,
-        run_seen_urls: set[str] | None = None,
         fast_mode: bool = False,
     ) -> tuple[str, list[dict], int]:
         """Execute a single task with iterative tool calling.
@@ -123,11 +122,13 @@ class Executor:
         # Fetch existing URLs for this run to avoid duplicate source records
         async with _session_access(session_lock):
             existing_url_res = await session.execute(
-                select(Source.url).where(Source.run_id == task.run_id)
+                select(Source.url).where(
+                    Source.run_id == task.run_id,
+                    Source.task_id == task.id,
+                )
             )
             existing_urls = existing_url_res.scalars().all()
-            seen_urls = run_seen_urls if run_seen_urls is not None else set()
-            seen_urls.update(existing_urls)
+            seen_urls = set(existing_urls)
 
         accumulated_sources: list[dict] = []
         task_tools_count = 0
@@ -162,12 +163,30 @@ class Executor:
                         for declaration in tool_declarations
                     )
                     if search_enabled:
+                        is_resource_task = task.title == "Resource research"
+                        if is_resource_task:
+                            query = (
+                                f"{goal} tutorial videos courses current trending resources"
+                            )
+                            if any(
+                                term in goal.lower()
+                                for term in (
+                                    "job", "career", "intern", "hiring", "application"
+                                )
+                            ):
+                                query += " official job openings application links"
+                        else:
+                            query = goal
                         step = LLMStepResponse(
                             is_tool_call=True,
                             tool_name="web_search",
                             tool_args={
-                                "query": goal[:400],
-                                "max_results": self._settings.max_search_results,
+                                "query": query[:400],
+                                "max_results": (
+                                    self._settings.max_search_results
+                                    if is_resource_task
+                                    else 1
+                                ),
                             },
                         )
                     else:
@@ -278,6 +297,28 @@ class Executor:
                     "name": tool_name,
                     "content": tool_llm_content,
                 })
+                if fast_mode and task.title == "Resource research":
+                    if result.success and result.sources:
+                        resource_lines = ["# Kickstart Resources", ""]
+                        for source in result.sources:
+                            title = str(source.get("title") or "Useful resource")
+                            url = str(source.get("url") or "")
+                            snippet = " ".join(
+                                str(source.get("snippet") or "").split()
+                            )
+                            if len(snippet) > 280:
+                                snippet = snippet[:277].rstrip() + "..."
+                            if url:
+                                resource_lines.append(f"- [{title}]({url})")
+                                if snippet:
+                                    resource_lines.append(f"  {snippet}")
+                        final_content = "\n".join(resource_lines)
+                    else:
+                        final_content = (
+                            "No resources were retrieved. Retry the run to search for "
+                            "tutorials, courses, and other relevant links."
+                        )
+                    break
 
             else:
                 # LLM determined no further tools are needed and produced a final answer

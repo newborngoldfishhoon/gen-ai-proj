@@ -9,8 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.logging import setup_logging
 from app.db.session import dispose_engine
-from app.api.routes import router
+from app.api.routes import recover_stale_runs, router
 from app.schemas.agent import HealthResponse
+from app.services.pdf_export import close_pdf_browser
 
 logger = logging.getLogger("agentforge")
 
@@ -22,8 +23,10 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("AgentForge starting — environment: %s", settings.environment)
     logger.info("LLM provider: %s", settings.llm_provider)
+    await recover_stale_runs()
     yield
     logger.info("AgentForge shutting down")
+    await close_pdf_browser()
     await dispose_engine()
 
 

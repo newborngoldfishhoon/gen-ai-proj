@@ -98,6 +98,42 @@ async def test_fast_mode_searches_without_spending_an_llm_tool_selection_call(db
 
 
 @pytest.mark.asyncio
+async def test_fast_resource_task_searches_multiple_links_without_an_llm_call(db_session):
+    run = AgentRun(goal="Learn practical data visualization", status=RunStatus.RUNNING)
+    db_session.add(run)
+    await db_session.commit()
+    await db_session.refresh(run)
+
+    task = AgentTask(
+        run_id=run.id,
+        title="Resource research",
+        description="Find tutorial videos and courses",
+        order_index=1,
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    provider = CountingMockProvider()
+    result, sources, tools_used = await Executor(provider).execute_task(
+        task=task,
+        goal=run.goal,
+        previous_results=[],
+        session=db_session,
+        tool_budget=RunToolBudget(1),
+        fast_mode=True,
+    )
+
+    assert provider.step_calls == 0
+    assert tools_used == 1
+    assert sources
+    assert "# Kickstart Resources" in result
+    assert sources[0]["url"] in result
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_execute_task_failure(db_session):
     """Test task execution failure handling."""
     run = AgentRun(goal="Test goal", status=RunStatus.RUNNING)
