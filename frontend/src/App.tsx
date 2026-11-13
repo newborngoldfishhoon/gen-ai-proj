@@ -282,9 +282,10 @@ export default function App() {
 
         {/* Footer */}
         <footer className="mt-16 text-center text-xs text-surface-600">
-          <p>AgentForge v0.2.0 — Phase 2: Tool Use & Web Research</p>
+          <p>AgentForge v0.2.0 : Tool Use & Web Research</p>
           <p className="mt-1">
             Autonomous tool use with live web search, webpage extraction, evidence tracking, and citation-backed reports.
+            Made by hotriya paliwal
           </p>
         </footer>
           </>
