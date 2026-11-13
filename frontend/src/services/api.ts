@@ -10,6 +10,7 @@ import type {
   ToolCall,
   Source,
 } from '../types/agent';
+import { getRequestAuthHeaders } from '../lib/supabase';
 
 const API_BASE = '/api';
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -36,9 +37,11 @@ async function request<T>(
   );
 
   try {
+    const authHeaders = await getRequestAuthHeaders();
     const response = await fetch(url, {
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders,
         ...options?.headers,
       },
       ...options,
@@ -124,9 +127,13 @@ export const api = {
       PDF_EXPORT_TIMEOUT_MS,
     );
     try {
+      const authHeaders = await getRequestAuthHeaders();
       const response = await fetch(`${API_BASE}/runs/${runId}/pdf`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
         body: JSON.stringify({ html }),
         signal: controller.signal,
       });

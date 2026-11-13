@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from playwright.async_api import Error as PlaywrightError
@@ -28,10 +28,71 @@ from app.services.llm_provider import create_llm_provider
 from app.agent.orchestrator import Orchestrator
 from app.core.config import get_settings
 from app.services.pdf_export import render_report_pdf
+from app.services.auth import Principal, get_current_principal
 
 logger = logging.getLogger("agentforge.api")
 
 router = APIRouter(prefix="/api", tags=["agent"])
+GUEST_RUN_TTL = timedelta(hours=24)
+
+
+def _run_access_filter(principal: Principal):
+    if principal.user_id is not None:
+        return AgentRun.owner_user_id == principal.user_id
+    return and_(
+        AgentRun.guest_session_hash == principal.guest_session_hash,
+        AgentRun.guest_expires_at > datetime.now(timezone.utc),
+    )
+
+
+async def _get_authorized_run(
+    run_id: UUID,
+    principal: Principal,
+    session: AsyncSession,
+    *,
+    include_details: bool = False,
+) -> AgentRun | None:
+    query = select(AgentRun).where(
+        AgentRun.id == run_id,
+        _run_access_filter(principal),
+    )
+    if include_details:
+        query = query.options(
+            selectinload(AgentRun.tasks).selectinload(AgentTask.tool_calls),
+            selectinload(AgentRun.tool_calls),
+            selectinload(AgentRun.sources),
+        )
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def _purge_expired_guest_runs(session: AsyncSession) -> int:
+    result = await session.execute(
+        select(AgentRun)
+        .where(
+            AgentRun.owner_user_id.is_(None),
+            AgentRun.guest_expires_at <= datetime.now(timezone.utc),
+        )
+        .options(
+            selectinload(AgentRun.tasks),
+            selectinload(AgentRun.tool_calls),
+            selectinload(AgentRun.sources),
+        )
+    )
+    expired_runs = result.scalars().all()
+    for run in expired_runs:
+        await session.delete(run)
+    return len(expired_runs)
+
+
+async def purge_expired_guest_runs() -> int:
+    """Delete expired temporary guest runs and all related data."""
+    factory = get_session_factory()
+    async with factory() as session:
+        deleted = await _purge_expired_guest_runs(session)
+        if deleted:
+            await session.commit()
+        return deleted
 
 
 async def recover_stale_runs() -> int:
@@ -41,6 +102,7 @@ async def recover_stale_runs() -> int:
     stale_before = now - timedelta(seconds=settings.agent_run_timeout_seconds * 2)
     factory = get_session_factory()
     async with factory() as session:
+        purged_count = await _purge_expired_guest_runs(session)
         result = await session.execute(
             select(AgentRun)
             .options(selectinload(AgentRun.tasks))
@@ -64,9 +126,12 @@ async def recover_stale_runs() -> int:
                     task.error_message = run.error_message
                     task.completed_at = now
                     session.add(task)
-        if stale_runs:
+        if stale_runs or purged_count:
             await session.commit()
+        if stale_runs:
             logger.warning("Recovered %d stale agent run(s)", len(stale_runs))
+        if purged_count:
+            logger.info("Deleted %d expired guest run(s)", purged_count)
         return len(stale_runs)
 
 
@@ -81,12 +146,23 @@ async def recover_stale_runs() -> int:
 async def create_run(
     request: RunCreateRequest,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Create a new agent run and start background execution."""
     goal = request.goal.strip()
+    await _purge_expired_guest_runs(session)
 
     # Create the run record
-    run = AgentRun(goal=goal, status=RunStatus.PLANNING)
+    run = AgentRun(
+        goal=goal,
+        status=RunStatus.PLANNING,
+        owner_user_id=principal.user_id,
+        guest_session_hash=principal.guest_session_hash,
+        guest_expires_at=(
+            datetime.now(timezone.utc) + GUEST_RUN_TTL
+            if principal.is_guest else None
+        ),
+    )
     session.add(run)
     await session.commit()
     await session.refresh(run)
@@ -119,12 +195,10 @@ async def create_run(
 async def retry_run(
     run_id: UUID,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Create a fresh run for a failed goal without altering its previous attempt."""
-    result = await session.execute(
-        select(AgentRun).where(AgentRun.id == run_id)
-    )
-    previous_run = result.scalar_one_or_none()
+    previous_run = await _get_authorized_run(run_id, principal, session)
     if previous_run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if previous_run.status != RunStatus.FAILED:
@@ -133,7 +207,16 @@ async def retry_run(
             detail="Only failed runs can be retried.",
         )
 
-    retry = AgentRun(goal=previous_run.goal, status=RunStatus.PLANNING)
+    retry = AgentRun(
+        goal=previous_run.goal,
+        status=RunStatus.PLANNING,
+        owner_user_id=principal.user_id,
+        guest_session_hash=principal.guest_session_hash,
+        guest_expires_at=(
+            datetime.now(timezone.utc) + GUEST_RUN_TTL
+            if principal.is_guest else None
+        ),
+    )
     session.add(retry)
     await session.commit()
     await session.refresh(retry)
@@ -218,9 +301,17 @@ async def list_runs(
     limit: int = Query(default=20, ge=1, le=100, description="Max runs to return"),
     offset: int = Query(default=0, ge=0, description="Pagination offset"),
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """List recent agent runs with summary metadata."""
-    count_result = await session.execute(select(func.count(AgentRun.id)))
+    await _purge_expired_guest_runs(session)
+    if principal.is_guest:
+        return RunListResponse(runs=[], total=0)
+
+    owned_runs = AgentRun.owner_user_id == principal.user_id
+    count_result = await session.execute(
+        select(func.count(AgentRun.id)).where(owned_runs)
+    )
     total = count_result.scalar() or 0
 
     task_counts = (
@@ -270,6 +361,7 @@ async def list_runs(
         .outerjoin(task_counts, task_counts.c.run_id == AgentRun.id)
         .outerjoin(tool_counts, tool_counts.c.run_id == AgentRun.id)
         .outerjoin(source_counts, source_counts.c.run_id == AgentRun.id)
+        .where(owned_runs)
         .order_by(AgentRun.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -307,9 +399,10 @@ async def export_run_pdf(
     run_id: UUID,
     request: PdfExportRequest,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Render the report's existing browser markup to an A4 PDF."""
-    run = await session.get(AgentRun, run_id)
+    run = await _get_authorized_run(run_id, principal, session)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if run.status != RunStatus.COMPLETED or not run.final_report:
@@ -346,18 +439,15 @@ async def export_run_pdf(
 async def get_run(
     run_id: UUID,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Get full details of a specific agent run."""
-    result = await session.execute(
-        select(AgentRun)
-        .options(
-            selectinload(AgentRun.tasks).selectinload(AgentTask.tool_calls),
-            selectinload(AgentRun.tool_calls),
-            selectinload(AgentRun.sources),
-        )
-        .where(AgentRun.id == run_id)
+    run = await _get_authorized_run(
+        run_id,
+        principal,
+        session,
+        include_details=True,
     )
-    run = result.scalar_one_or_none()
 
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
@@ -375,8 +465,12 @@ async def get_run(
 async def get_run_tools(
     run_id: UUID,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Return all tool calls executed during a run."""
+    run = await _get_authorized_run(run_id, principal, session)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     result = await session.execute(
         select(ToolCall)
         .where(ToolCall.run_id == run_id)
@@ -395,8 +489,12 @@ async def get_run_tools(
 async def get_run_sources(
     run_id: UUID,
     session: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
     """Return all sources gathered during a run."""
+    run = await _get_authorized_run(run_id, principal, session)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     result = await session.execute(
         select(Source)
         .where(Source.run_id == run_id)

@@ -5,6 +5,7 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
 from app.main import create_app
+from app.services.auth import Principal, get_current_principal
 
 
 @pytest_asyncio.fixture
@@ -27,6 +28,11 @@ async def client():
     factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     app = create_app()
+    test_user_id = "00000000-0000-0000-0000-000000000001"
+
+    async def override_principal():
+        from uuid import UUID
+        return Principal(user_id=UUID(test_user_id))
 
     # Override the get_db dependency
     from app.db.session import get_db
@@ -41,6 +47,7 @@ async def client():
                 raise
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_principal] = override_principal
 
     # Also patch get_session_factory for background tasks
     import app.db.session as session_module
@@ -50,6 +57,7 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         ac.test_session_factory = factory
+        ac.test_app = app
         yield ac
 
     session_module.get_session_factory = original_factory
@@ -104,6 +112,127 @@ async def test_list_runs_empty(client):
     data = response.json()
     assert data["runs"] == []
     assert data["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_endpoints_require_a_user_or_guest_session(client):
+    client.test_app.dependency_overrides.pop(get_current_principal)
+
+    response = await client.get("/api/runs")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_run_history_and_details_are_scoped_to_signed_in_user(client, monkeypatch):
+    import app.api.routes as routes
+    from uuid import UUID
+    from app.models.agent import AgentRun
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    created = await client.post("/api/runs", json={"goal": "Private user research"})
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+
+    async with client.test_session_factory() as session:
+        run = await session.get(AgentRun, UUID(run_id))
+        assert run is not None
+        assert str(run.owner_user_id) == "00000000-0000-0000-0000-000000000001"
+        assert run.guest_session_hash is None
+
+    response = await client.get(f"/api/runs/{run_id}")
+    assert response.status_code == 200
+
+    async def another_user():
+        return Principal(user_id=UUID("00000000-0000-0000-0000-000000000002"))
+
+    client.test_app.dependency_overrides[get_current_principal] = another_user
+    assert (await client.get("/api/runs")).json()["total"] == 0
+    assert (await client.get(f"/api/runs/{run_id}")).status_code == 404
+    assert (await client.get(f"/api/runs/{run_id}/tools")).status_code == 404
+    assert (await client.get(f"/api/runs/{run_id}/sources")).status_code == 404
+    assert (await client.post(
+        f"/api/runs/{run_id}/pdf",
+        json={"html": "<h1>Private report</h1>"},
+    )).status_code == 404
+    assert (await client.post(f"/api/runs/{run_id}/retry")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_guest_runs_are_private_temporary_and_not_listed(client, monkeypatch):
+    import app.api.routes as routes
+    from uuid import UUID
+    from app.models.agent import AgentRun
+    from app.services.auth import hash_guest_token
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    guest_token = "a" * 64
+
+    async def guest_principal():
+        return Principal(guest_session_hash=hash_guest_token(guest_token))
+
+    client.test_app.dependency_overrides[get_current_principal] = guest_principal
+    created = await client.post("/api/runs", json={"goal": "Temporary guest research"})
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+    assert (await client.get("/api/runs")).json() == {"runs": [], "total": 0}
+    assert (await client.get(f"/api/runs/{run_id}")).status_code == 200
+
+    async with client.test_session_factory() as session:
+        run = await session.get(AgentRun, UUID(run_id))
+        assert run is not None
+        assert run.owner_user_id is None
+        assert run.guest_session_hash == hash_guest_token(guest_token)
+        assert run.guest_expires_at is not None
+
+    async def other_guest():
+        return Principal(guest_session_hash=hash_guest_token("b" * 64))
+
+    client.test_app.dependency_overrides[get_current_principal] = other_guest
+    assert (await client.get(f"/api/runs/{run_id}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_expired_guest_runs_are_deleted(client, monkeypatch):
+    import app.api.routes as routes
+    from datetime import datetime, timedelta, timezone
+    from app.models.agent import AgentRun
+    from app.services.auth import hash_guest_token
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    guest_token = "c" * 64
+
+    async def guest_principal():
+        return Principal(guest_session_hash=hash_guest_token(guest_token))
+
+    client.test_app.dependency_overrides[get_current_principal] = guest_principal
+    created = await client.post("/api/runs", json={"goal": "Expired guest research"})
+    run_id = created.json()["id"]
+
+    async with client.test_session_factory() as session:
+        from uuid import UUID
+        run = await session.get(AgentRun, UUID(run_id))
+        assert run is not None
+        run.guest_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.commit()
+
+    response = await client.get("/api/runs")
+    assert response.status_code == 200
+    assert response.json() == {"runs": [], "total": 0}
+    assert (await client.get(f"/api/runs/{run_id}")).status_code == 404
+
+    async with client.test_session_factory() as session:
+        from uuid import UUID
+        assert await session.get(AgentRun, UUID(run_id)) is None
 
 
 @pytest.mark.asyncio

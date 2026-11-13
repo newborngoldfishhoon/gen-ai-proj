@@ -62,6 +62,9 @@ class AgentRun(Base):
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
     goal = Column(Text, nullable=False)
+    owner_user_id = Column(Uuid, nullable=True, index=True)
+    guest_session_hash = Column(String(64), nullable=True, index=True)
+    guest_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     status = Column(
         Enum(
             RunStatus,

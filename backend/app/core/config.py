@@ -44,6 +44,8 @@ class Settings(BaseSettings):
 
     # Search & Tool Provider settings
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
+    supabase_url: str = Field(default="", alias="SUPABASE_URL")
+    supabase_anon_key: str = Field(default="", alias="SUPABASE_ANON_KEY")
     search_provider: str = Field(default="tavily", alias="SEARCH_PROVIDER")
     agent_enable_web_search: bool = Field(default=True, alias="AGENT_ENABLE_WEB_SEARCH")
     agent_enable_calculator: bool = Field(default=True, alias="AGENT_ENABLE_CALCULATOR")

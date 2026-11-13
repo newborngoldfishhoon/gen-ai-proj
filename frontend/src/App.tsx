@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import type { RunListItem } from './types/agent';
 import api from './services/api';
 import GoalInput from './components/GoalInput';
+import LoginGate from './components/LoginGate';
 import RunHistory from './components/RunHistory';
 import RunDetail from './components/RunDetail';
-import { Cpu, AlertTriangle, RefreshCw } from 'lucide-react';
+import { clearGuestSession, GUEST_SESSION_KEY, startGuestSession, supabase } from './lib/supabase';
+import { Cpu, AlertTriangle, LogOut, RefreshCw, UserRound } from 'lucide-react';
 
 type View = { type: 'dashboard' } | { type: 'detail'; runId: string };
 
@@ -14,9 +17,62 @@ export default function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingRuns, setIsLoadingRuns] = useState(true);
   const [error, setError] = useState('');
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [isGuest, setIsGuest] = useState(false);
   const hasLoadedRuns = useRef(false);
+  const activeUserId = useRef<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const applySession = (nextSession: Session | null) => {
+      const nextUserId = nextSession?.user.id ?? null;
+      if (activeUserId.current !== nextUserId) {
+        activeUserId.current = nextUserId;
+        hasLoadedRuns.current = false;
+        setRuns([]);
+        setIsLoadingRuns(Boolean(nextUserId));
+        setView({ type: 'dashboard' });
+      }
+      setSession(nextSession);
+      if (nextSession) {
+        clearGuestSession();
+        setIsGuest(false);
+      } else {
+        setIsGuest(Boolean(sessionStorage.getItem(GUEST_SESSION_KEY)));
+      }
+    };
+
+    if (!supabase) {
+      setIsGuest(Boolean(sessionStorage.getItem(GUEST_SESSION_KEY)));
+      setAuthReady(true);
+      return;
+    }
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!active) return;
+      applySession(nextSession);
+    });
+
+    void supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (!active) return;
+      if (sessionError) setError(`Could not restore sign-in: ${sessionError.message}`);
+      applySession(data.session);
+      setAuthReady(true);
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
   const fetchRuns = useCallback(async () => {
+    if (!session) {
+      setRuns([]);
+      setIsLoadingRuns(false);
+      return;
+    }
     try {
       const data = await api.listRuns(20, 0);
       setRuns(data.runs);
@@ -33,15 +89,61 @@ export default function App() {
     } finally {
       setIsLoadingRuns(false);
     }
-  }, []);
+  }, [session]);
 
   useEffect(() => {
+    if (!authReady) return;
     fetchRuns();
-
-    // Poll for updates while on dashboard
+    if (!session) return;
     const interval = setInterval(fetchRuns, 5000);
     return () => clearInterval(interval);
-  }, [fetchRuns]);
+  }, [authReady, fetchRuns, session]);
+
+  const handleGoogleSignIn = async () => {
+    if (!supabase) {
+      throw new Error('Google sign-in is not configured. Add the Supabase URL and publishable key.');
+    }
+    const { error: signInError } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (signInError) throw signInError;
+  };
+
+  const handleGoogleSignInClick = async () => {
+    try {
+      await handleGoogleSignIn();
+    } catch (signInError) {
+      setError(signInError instanceof Error ? signInError.message : 'Google sign-in failed.');
+    }
+  };
+
+  const handleContinueAsGuest = () => {
+    startGuestSession();
+    setIsGuest(true);
+    setView({ type: 'dashboard' });
+  };
+
+  const handleSignOut = async () => {
+    if (supabase) {
+      const { error: signOutError } = await supabase.auth.signOut();
+      if (signOutError) {
+        setError(`Could not sign out: ${signOutError.message}`);
+        return;
+      }
+    }
+    setSession(null);
+    setRuns([]);
+    hasLoadedRuns.current = false;
+    setIsLoadingRuns(false);
+    setView({ type: 'dashboard' });
+  };
+
+  const handleLeaveGuest = () => {
+    clearGuestSession();
+    setIsGuest(false);
+    setView({ type: 'dashboard' });
+  };
 
   const handleSubmitGoal = async (goal: string) => {
     setIsSubmitting(true);
@@ -51,8 +153,7 @@ export default function App() {
       const result = await api.createRun(goal);
       // Navigate to the run detail
       setView({ type: 'detail', runId: result.id });
-      // Refresh runs list
-      fetchRuns();
+      if (session) fetchRuns();
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Failed to start agent run'
@@ -85,6 +186,38 @@ export default function App() {
       </div>
 
       <div className="relative max-w-4xl mx-auto px-4 py-8 md:py-12">
+        {!authReady ? (
+          <div className="glass-card mx-auto max-w-md p-8 text-center text-sm text-surface-400">
+            Checking your sign-in…
+          </div>
+        ) : !session && !isGuest ? (
+          <LoginGate
+            googleConfigured={Boolean(supabase)}
+            onGoogleSignIn={handleGoogleSignIn}
+            onContinueAsGuest={handleContinueAsGuest}
+          />
+        ) : (
+          <>
+        <div className="mb-6 flex justify-end">
+          {session ? (
+            <button onClick={handleSignOut} className="btn-secondary text-xs">
+              <LogOut size={14} />
+              {session.user.email || 'Signed in'} · Sign out
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 text-xs text-surface-400">
+                <UserRound size={14} /> Guest session
+              </span>
+              <button onClick={handleGoogleSignInClick} disabled={!supabase} className="btn-secondary text-xs">
+                Sign in to save history
+              </button>
+              <button onClick={handleLeaveGuest} className="btn-secondary text-xs">
+                Exit guest
+              </button>
+            </div>
+          )}
+        </div>
         {/* Header */}
         <header className="text-center mb-10 animate-fade-in">
           <div className="inline-flex items-center gap-3 mb-4">
@@ -126,6 +259,8 @@ export default function App() {
               runs={runs}
               onSelectRun={handleSelectRun}
               isLoading={isLoadingRuns}
+              isGuest={isGuest}
+              onSignIn={handleGoogleSignInClick}
             />
           </div>
         ) : (
@@ -143,6 +278,8 @@ export default function App() {
             Autonomous tool use with live web search, webpage extraction, evidence tracking, and citation-backed reports.
           </p>
         </footer>
+          </>
+        )}
       </div>
     </div>
   );

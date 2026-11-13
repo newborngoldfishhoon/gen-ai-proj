@@ -7,6 +7,8 @@ interface RunHistoryProps {
   runs: RunListItem[];
   onSelectRun: (runId: string) => void;
   isLoading: boolean;
+  isGuest?: boolean;
+  onSignIn?: () => Promise<void>;
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -29,6 +31,8 @@ export default function RunHistory({
   runs,
   onSelectRun,
   isLoading,
+  isGuest = false,
+  onSignIn,
 }: RunHistoryProps) {
   if (isLoading) {
     return (
@@ -50,11 +54,18 @@ export default function RunHistory({
       <div className="glass-card p-8 text-center">
         <Inbox size={40} className="mx-auto text-surface-600 mb-3" />
         <h3 className="text-sm font-medium text-surface-400 mb-1">
-          No runs yet
+          {isGuest ? 'Guest history is not saved' : 'No runs yet'}
         </h3>
         <p className="text-xs text-surface-500">
-          Submit a goal above to start your first agent run.
+          {isGuest
+            ? 'Sign in with Google to save your research and view it again later.'
+            : 'Submit a goal above to start your first agent run.'}
         </p>
+        {isGuest && onSignIn && (
+          <button onClick={() => void onSignIn()} className="btn-secondary mt-4 text-xs">
+            Sign in with Google to save history
+          </button>
+        )}
       </div>
     );
   }
