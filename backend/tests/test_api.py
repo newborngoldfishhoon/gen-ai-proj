@@ -49,6 +49,7 @@ async def client():
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.test_session_factory = factory
         yield ac
 
     session_module.get_session_factory = original_factory
@@ -112,6 +113,48 @@ async def test_get_run_not_found(client):
     fake_id = str(uuid.uuid4())
     response = await client.get(f"/api/runs/{fake_id}")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_run_creates_new_run_with_same_goal(client, monkeypatch):
+    """Retry starts a new attempt and leaves the failed run unchanged."""
+    import app.api.routes as routes
+    from uuid import UUID
+    from app.models.agent import AgentRun, RunStatus
+
+    async def skip_background(_run_id, _goal):
+        return None
+
+    monkeypatch.setattr(routes, "_execute_run_background", skip_background)
+    created = await client.post("/api/runs", json={"goal": "Research retry behavior"})
+    assert created.status_code == 201
+    original_id = created.json()["id"]
+
+    async with client.test_session_factory() as session:
+        original = await session.get(AgentRun, UUID(original_id))
+        assert original is not None
+        original.status = RunStatus.FAILED
+        original.error_message = "The AI provider is rate-limited (HTTP 429)."
+        await session.commit()
+
+    retried = await client.post(f"/api/runs/{original_id}/retry")
+
+    assert retried.status_code == 201
+    assert retried.json()["id"] != original_id
+    assert retried.json()["status"] == "planning"
+
+    details = await client.get(f"/api/runs/{retried.json()['id']}")
+    assert details.status_code == 200
+    assert details.json()["goal"] == "Research retry behavior"
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_non_failed_run(client):
+    created = await client.post("/api/runs", json={"goal": "Do not retry active run"})
+    retried = await client.post(f"/api/runs/{created.json()['id']}/retry")
+
+    assert retried.status_code == 409
+    assert retried.json()["detail"] == "Only failed runs can be retried."
 
 
 @pytest.mark.asyncio
@@ -190,4 +233,3 @@ async def test_get_run_tools_and_sources(client):
     sources_response = await client.get(f"/api/runs/{run_id}/sources")
     assert sources_response.status_code == 200
     assert isinstance(sources_response.json(), list)
-

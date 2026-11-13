@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentTask, TaskStatus, ToolCall, ToolCallStatus, Source, ExtractionStatus
-from app.services.llm_provider import LLMProvider
+from app.services.llm_provider import LLMProvider, LLMStepResponse
 from app.tools.registry import ToolRegistry, create_default_registry
 from app.core.config import get_settings
 
@@ -90,6 +90,7 @@ class Executor:
         session_lock: asyncio.Lock | None = None,
         tool_budget: RunToolBudget | None = None,
         run_seen_urls: set[str] | None = None,
+        fast_mode: bool = False,
     ) -> tuple[str, list[dict], int]:
         """Execute a single task with iterative tool calling.
 
@@ -155,12 +156,34 @@ class Executor:
                 break
 
             try:
-                # Ask LLM for next action
-                step = await self._llm.generate_step(
-                    messages=messages,
-                    tools=tool_declarations,
-                    system_instruction=EXECUTION_SYSTEM_PROMPT,
-                )
+                if fast_mode and iteration == 1:
+                    search_enabled = any(
+                        declaration.get("name") == "web_search"
+                        for declaration in tool_declarations
+                    )
+                    if search_enabled:
+                        step = LLMStepResponse(
+                            is_tool_call=True,
+                            tool_name="web_search",
+                            tool_args={
+                                "query": goal[:400],
+                                "max_results": self._settings.max_search_results,
+                            },
+                        )
+                    else:
+                        step = await self._llm.generate_step(
+                            messages=messages,
+                            tools=[],
+                            system_instruction=EXECUTION_SYSTEM_PROMPT,
+                        )
+                else:
+                    # In fast mode, the search is selected locally; only the final answer
+                    # requires a model request.
+                    step = await self._llm.generate_step(
+                        messages=messages,
+                        tools=tool_declarations,
+                        system_instruction=EXECUTION_SYSTEM_PROMPT,
+                    )
             except Exception as e:
                 logger.warning("LLM step generation failed: %s; falling back to direct text generation", str(e))
                 break
@@ -246,11 +269,14 @@ class Executor:
                     "role": "model",
                     "tool_call": {"id": tc_id, "name": tool_name, "args": tool_args},
                 })
+                tool_llm_content = result.to_llm_string()
+                if len(tool_llm_content) > 3000:
+                    tool_llm_content = tool_llm_content[:3000] + "\n\n... [Content truncated for context safety]"
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "name": tool_name,
-                    "content": result.to_llm_string(),
+                    "content": tool_llm_content,
                 })
 
             else:
@@ -285,7 +311,12 @@ class Executor:
                     raw = str(ex)
                     logger.error("Task %d generation failed completely: %s", task.order_index + 1, raw)
                     # Sanitize the error shown to the user — never surface raw HTTP exception strings.
-                    if "400" in raw or "401" in raw or "429" in raw or "5" in raw[:3]:
+                    if "429" in raw:
+                        user_msg = (
+                            "The AI provider is temporarily rate-limited (HTTP 429). "
+                            "Wait briefly, then retry this run."
+                        )
+                    elif "400" in raw or "401" in raw or "413" in raw or "5" in raw[:3]:
                         user_msg = (
                             "The AI provider returned an error while generating the task result. "
                             "Please retry the run. If the problem persists, check backend logs for details."
@@ -341,7 +372,10 @@ class Executor:
             "Complete this task. If factual information, job requirements, dates, or live research "
             "is needed, use the available tools (web_search, extract_webpage, calculator). "
             "If the task can be answered with existing context or pure reasoning, answer directly.\n"
-            "Ensure any claims backed by web search cite their sources with markdown links [Title](url)."
+            "Return a concise Markdown report: a specific title, one-sentence vision, brief executive "
+            "summary, key findings, and a practical 3-5 step roadmap when appropriate. Keep it under "
+            "500 words unless the goal clearly needs more detail. Cite factual claims with source "
+            "links [Title](url); do not invent facts or citations."
         )
 
         return "\n".join(parts)

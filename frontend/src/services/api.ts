@@ -73,6 +73,13 @@ export const api = {
     });
   },
 
+  /** Retry a failed run by creating a new run with the same goal */
+  retryRun(runId: string): Promise<RunCreatedResponse> {
+    return request<RunCreatedResponse>(`/runs/${runId}/retry`, {
+      method: 'POST',
+    });
+  },
+
   /** List recent runs */
   listRuns(limit = 20, offset = 0): Promise<RunListResponse> {
     return request<RunListResponse>(`/runs?limit=${limit}&offset=${offset}`);

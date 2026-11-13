@@ -87,7 +87,7 @@ async def test_full_orchestration_with_tools_and_citations(db_session):
 
     assert run.status == RunStatus.COMPLETED
     assert run.final_report is not None
-    assert "## Sources & Citations" in run.final_report
+    assert "## Sources & Evidence" in run.final_report
 
     # Ensure report contains markdown links to actual retrieved sources
     assert "https://" in run.final_report

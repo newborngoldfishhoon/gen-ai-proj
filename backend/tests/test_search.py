@@ -1,9 +1,40 @@
 """Unit tests for web search, webpage extraction, and SSRF security controls."""
 
+from types import SimpleNamespace
+
 import pytest
 from app.tools.search_provider import MockSearchProvider, TavilySearchProvider, SafeHttpExtractor, SearchProviderError
 from app.tools.web_search import WebSearchTool
 from app.tools.extract_webpage import ExtractWebpageTool
+
+
+@pytest.mark.asyncio
+async def test_web_search_respects_configured_result_limit(monkeypatch):
+    class RecordingProvider:
+        max_results = None
+
+        async def search(self, query, max_results=5):
+            self.max_results = max_results
+            return [{
+                "title": "Result",
+                "url": "https://example.com",
+                "domain": "example.com",
+                "snippet": "Evidence",
+            }]
+
+    provider = RecordingProvider()
+    monkeypatch.setattr(
+        "app.tools.web_search.get_settings",
+        lambda: SimpleNamespace(max_search_results=3),
+    )
+
+    result = await WebSearchTool(provider=provider).execute(
+        query="relevant research",
+        max_results=10,
+    )
+
+    assert result.success
+    assert provider.max_results == 3
 
 
 @pytest.mark.asyncio

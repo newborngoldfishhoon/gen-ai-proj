@@ -26,9 +26,9 @@ class Orchestrator:
 
     def __init__(self, llm: LLMProvider, registry: ToolRegistry | None = None):
         self._registry = registry or create_default_registry()
-        self._planner = Planner(llm)
+        self._planner = Planner()
         self._executor = Executor(llm, registry=self._registry)
-        self._reporter = Reporter(llm)
+        self._reporter = Reporter()
 
     async def run_agent(self, run: AgentRun, session: AsyncSession) -> None:
         """Execute the complete agent workflow for a given run.
@@ -74,14 +74,7 @@ class Orchestrator:
             all_sources: list[dict] = []
             settings = get_settings()
             session_lock = asyncio.Lock()
-            final_tool_limit = min(
-                settings.max_tool_calls_per_task,
-                settings.max_tool_calls_per_run,
-            )
-            parallel_tool_budget = RunToolBudget(
-                settings.max_tool_calls_per_run - final_tool_limit
-            )
-            final_tool_budget = RunToolBudget(final_tool_limit)
+            parallel_tool_budget = RunToolBudget(settings.max_tool_calls_per_run)
             run_seen_urls: set[str] = set()
             task_semaphore = asyncio.Semaphore(
                 min(settings.max_concurrent_tasks, len(tasks))
@@ -98,6 +91,7 @@ class Orchestrator:
                         session_lock=session_lock,
                         tool_budget=parallel_tool_budget,
                         run_seen_urls=run_seen_urls,
+                        fast_mode=True,
                     )
 
             outcomes = await asyncio.gather(
@@ -133,7 +127,7 @@ class Orchestrator:
 
             await session.commit()
 
-            # ── Phase 4: Final research pass with full context ───
+            # ── Phase 4: Final report synthesis ──────────────────
             if not completed_results:
                 run.status = RunStatus.FAILED
                 run.error_message = "All tasks failed. No results to report."
@@ -145,98 +139,43 @@ class Orchestrator:
 
             final_task = AgentTask(
                 run_id=run.id,
-                title="Final Research and Synthesis",
+                title="Final Report",
                 description=(
-                    "Review all parallel task findings and gathered sources against the original goal. "
-                    "Identify contradictions or gaps, use web search or extraction to verify important "
-                    "claims and fill missing information, then produce a complete evidence-based synthesis."
+                    "Format the research answer and gathered sources into a structured report."
                 ),
                 order_index=len(tasks),
-                status=TaskStatus.PENDING,
+                status=TaskStatus.IN_PROGRESS,
+                started_at=datetime.now(timezone.utc),
             )
             session.add(final_task)
             await session.commit()
             await session.refresh(final_task)
 
-            final_context = list(completed_results)
-            if all_sources:
-                source_lines = []
-                for source in all_sources:
-                    url = source.get("url", "")
-                    title = source.get("title") or url or "Untitled source"
-                    excerpt = (
-                        source.get("extracted_content")
-                        or source.get("snippet")
-                        or ""
-                    )
-                    source_lines.append(
-                        f"- [{title}]({url}) {excerpt[:500]}"
-                    )
-                final_context.append({
-                    "title": "Sources gathered by parallel tasks",
-                    "result": "\n".join(source_lines),
-                })
-            if failed_tasks:
-                final_context.append({
-                    "title": "Parallel tasks that failed",
-                    "result": "\n".join(
-                        f"- {item['title']}: {item['error']}"
-                        for item in failed_tasks
-                    ),
-                })
-
-            try:
-                final_result, final_sources, _final_tools_used = (
-                    await self._executor.execute_task(
-                        task=final_task,
-                        goal=run.goal,
-                        previous_results=final_context,
-                        session=session,
-                        session_lock=session_lock,
-                        tool_budget=final_tool_budget,
-                        run_seen_urls=run_seen_urls,
-                    )
-                )
-                all_sources.extend(final_sources)
-                if final_task.status == TaskStatus.FAILED:
-                    failed_tasks.append({
-                        "title": final_task.title,
-                        "error": final_task.error_message or "Final research pass failed",
-                    })
-                else:
-                    completed_results.append({
-                        "title": final_task.title,
-                        "result": final_result,
-                    })
-            except Exception as e:
-                logger.error("Final research pass failed: %s", str(e))
-                final_task.status = TaskStatus.FAILED
-                final_task.error_message = str(e)
-                final_task.completed_at = datetime.now(timezone.utc)
-                session.add(final_task)
-                failed_tasks.append({
-                    "title": final_task.title,
-                    "error": final_task.error_message,
-                })
-
-            run_total_tools = (
-                parallel_tool_budget.used_calls + final_tool_budget.used_calls
-            )
-            await session.commit()
-
-            # ── Phase 5: Report generation with citations ─────────
+            # Report generation is the final synthesis step; a separate LLM research pass
+            # here would repeat synthesis and add another serial set of model/tool calls.
             report = await self._reporter.generate_report(
                 goal=run.goal,
                 task_results=completed_results,
                 sources=all_sources,
                 failed_tasks=failed_tasks if failed_tasks else None,
             )
+            final_task.result = report
+            final_task.status = TaskStatus.COMPLETED
+            final_task.completed_at = datetime.now(timezone.utc)
+            session.add(final_task)
+            await session.commit()
 
-            # ── Phase 6: Finalize run record ──────────────────────
+            # ── Phase 5: Finalize run record ──────────────────────
             run.final_report = report
             if failed_tasks:
                 run.status = RunStatus.FAILED
-                run.error_message = f"{len(failed_tasks)} task(s) failed during execution"
+                if any("429" in str(item.get("error", "")) for item in failed_tasks):
+                    run.error_message = (
+                        "The AI provider is temporarily rate-limited (HTTP 429). "
+                        "Wait briefly, then retry this run."
+                    )
+                else:
+                    run.error_message = f"{len(failed_tasks)} task(s) failed during execution"
             else:
                 run.status = RunStatus.COMPLETED
 
@@ -249,7 +188,7 @@ class Orchestrator:
                 run.id,
                 run.status.value,
                 len(completed_results),
-                run_total_tools,
+                parallel_tool_budget.used_calls,
                 len(all_sources),
             )
 

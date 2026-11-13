@@ -119,6 +119,62 @@
   .markdown-content blockquote {
     @apply border-l-4 border-brand-500 pl-4 italic text-surface-400 my-3;
   }
+  .markdown-content table {
+    @apply block w-full overflow-x-auto border-collapse text-left text-sm mb-4;
+  }
+  .markdown-content thead {
+    @apply bg-surface-700/70 text-surface-100;
+  }
+  .markdown-content th,
+  .markdown-content td {
+    @apply border border-surface-600/60 px-3 py-2 align-top;
+  }
+  .markdown-content tbody tr:nth-child(even) {
+    @apply bg-surface-800/60;
+  }
+
+  .report-card {
+    @apply overflow-hidden rounded-2xl border border-surface-700/50 bg-white shadow-xl shadow-black/10;
+  }
+  .report-paper {
+    color: #172033;
+    background: #fff;
+  }
+  .report-paper h1 {
+    color: #101828;
+    @apply mt-0 mb-5 text-3xl font-bold tracking-tight;
+  }
+  .report-paper h2 {
+    color: #1d2939;
+    @apply mt-7 border-b border-slate-200 pb-2 text-xl font-semibold;
+  }
+  .report-paper h3 {
+    color: #344054;
+    @apply mt-5 text-base font-semibold;
+  }
+  .report-paper p,
+  .report-paper li {
+    color: #344054;
+  }
+  .report-paper strong {
+    color: #101828;
+  }
+  .report-paper code {
+    @apply bg-slate-100 text-slate-800;
+  }
+  .report-paper pre {
+    @apply bg-slate-100 text-slate-800;
+  }
+  .report-paper th,
+  .report-paper td {
+    @apply border-slate-300;
+  }
+  .report-paper thead {
+    @apply bg-slate-100 text-slate-900;
+  }
+  .report-paper tbody tr:nth-child(even) {
+    @apply bg-slate-50;
+  }
 }
 
 /* Shimmer loading animation */

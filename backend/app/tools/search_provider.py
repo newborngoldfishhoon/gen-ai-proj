@@ -61,7 +61,7 @@ class TavilySearchProvider(SearchProvider):
     SEARCH_ENDPOINT = "https://api.tavily.com/search"
     EXTRACT_ENDPOINT = "https://api.tavily.com/extract"
 
-    def __init__(self, api_key: str | None = None, timeout: float = 20.0):
+    def __init__(self, api_key: str | None = None, timeout: float = 7.0):
         settings = get_settings()
         self._api_key = api_key or settings.tavily_api_key
         self._timeout = timeout

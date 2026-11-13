@@ -12,8 +12,8 @@ from app.models.agent import AgentRun, AgentTask, RunStatus, TaskStatus
 from app.services.llm_provider import MockProvider, LLMProvider
 
 
-class PlanFailProvider(LLMProvider):
-    """Provider that fails during planning."""
+class FailingProvider(LLMProvider):
+    """Provider that fails during task execution."""
     async def generate(self, prompt, *, system_instruction=None):
         raise RuntimeError("Planning failed")
 
@@ -53,14 +53,14 @@ async def test_full_orchestration_success(mock_llm, db_session):
 
 
 @pytest.mark.asyncio
-async def test_orchestration_planning_failure(db_session):
-    """Test that planning failure is handled gracefully."""
-    run = AgentRun(goal="This will fail during planning", status=RunStatus.PLANNING)
+async def test_orchestration_execution_failure(db_session):
+    """Test that task execution failures are persisted."""
+    run = AgentRun(goal="This will fail during task execution", status=RunStatus.PLANNING)
     db_session.add(run)
     await db_session.commit()
     await db_session.refresh(run)
 
-    orchestrator = Orchestrator(PlanFailProvider())
+    orchestrator = Orchestrator(FailingProvider())
     await orchestrator.run_agent(run, db_session)
 
     await db_session.refresh(run)
@@ -113,10 +113,10 @@ async def test_run_persistence(mock_llm, db_session):
 
 
 @pytest.mark.asyncio
-async def test_all_planned_tasks_run_concurrently_then_final_pass_gets_full_context(
+async def test_single_task_is_reported_without_extra_synthesis(
     mock_llm, db_session, monkeypatch
 ):
-    """Run six parallel tasks, then pass their results and sources to a final task."""
+    """Run one research task and format the report without another model call."""
     run = AgentRun(goal="Research and compare a topic", status=RunStatus.PLANNING)
     db_session.add(run)
     await db_session.commit()
@@ -125,8 +125,7 @@ async def test_all_planned_tasks_run_concurrently_then_final_pass_gets_full_cont
     orchestrator = Orchestrator(mock_llm)
     plan = ExecutionPlan.model_validate({
         "tasks": [
-            {"title": f"Research {index}", "description": "Research independently"}
-            for index in range(6)
+            {"title": "Research goal", "description": "Research independently"}
         ],
     })
 
@@ -137,55 +136,55 @@ async def test_all_planned_tasks_run_concurrently_then_final_pass_gets_full_cont
     monkeypatch.setattr(
         "app.agent.orchestrator.get_settings",
         lambda: SimpleNamespace(
-            max_concurrent_tasks=6,
-            max_tool_calls_per_task=5,
-            max_tool_calls_per_run=15,
+            max_concurrent_tasks=1,
+            max_tool_calls_per_task=1,
+            max_tool_calls_per_run=1,
         ),
     )
     active_tasks = 0
     max_active_tasks = 0
     completed_tasks = set()
-    final_context = []
+    report_inputs = []
 
     async def execute_task(task, goal, previous_results, session, **kwargs):
         nonlocal active_tasks, max_active_tasks
-        if task.order_index < 6:
-            assert previous_results == []
-            active_tasks += 1
-            max_active_tasks = max(max_active_tasks, active_tasks)
-            await asyncio.sleep(0.03)
-            completed_tasks.add(task.title)
-            source = {
-                "title": f"Source for {task.title}",
-                "url": f"https://example.com/{task.order_index}",
-                "snippet": f"Evidence for {task.title}",
-            }
-            tools_used = int(await kwargs["tool_budget"].reserve())
-        else:
-            assert completed_tasks == {f"Research {index}" for index in range(6)}
-            final_context.extend(previous_results)
-            source = None
-            tools_used = int(await kwargs["tool_budget"].reserve())
+        assert previous_results == []
+        active_tasks += 1
+        max_active_tasks = max(max_active_tasks, active_tasks)
+        await asyncio.sleep(0.03)
+        completed_tasks.add(task.title)
+        source = {
+            "title": f"Source for {task.title}",
+            "url": f"https://example.com/{task.order_index}",
+            "snippet": f"Evidence for {task.title}",
+        }
+        tools_used = int(await kwargs["tool_budget"].reserve())
 
         async with kwargs["session_lock"]:
             task.status = TaskStatus.COMPLETED
             task.result = f"Result for {task.title}"
             session.add(task)
             await session.commit()
-        if task.order_index < 6:
-            active_tasks -= 1
+        active_tasks -= 1
         return task.result, [source] if source else [], tools_used
 
+    async def generate_report(**kwargs):
+        report_inputs.append(kwargs)
+        return "# Structured report"
+
     monkeypatch.setattr(orchestrator._executor, "execute_task", execute_task)
+    monkeypatch.setattr(orchestrator._reporter, "generate_report", generate_report)
     await orchestrator.run_agent(run, db_session)
     await db_session.refresh(run)
 
-    assert max_active_tasks == 6
-    assert len(final_context) == 7
-    assert [item["title"] for item in final_context[:6]] == [
-        f"Research {index}" for index in range(6)
+    assert max_active_tasks == 1
+    assert completed_tasks == {"Research goal"}
+    assert len(report_inputs) == 1
+    assert [item["title"] for item in report_inputs[0]["task_results"]] == [
+        "Research goal"
     ]
-    assert final_context[6]["title"] == "Sources gathered by parallel tasks"
-    assert run.tasks[-1].title == "Final Research and Synthesis"
+    assert len(report_inputs[0]["sources"]) == 1
+    assert run.tasks[-1].title == "Final Report"
+    assert run.tasks[-1].result == run.final_report == "# Structured report"
     assert all(task.status == TaskStatus.COMPLETED for task in run.tasks)
     assert run.status == RunStatus.COMPLETED

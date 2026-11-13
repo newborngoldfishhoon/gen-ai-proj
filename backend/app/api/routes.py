@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,6 +24,7 @@ from app.schemas.agent import (
 )
 from app.services.llm_provider import create_llm_provider
 from app.agent.orchestrator import Orchestrator
+from app.core.config import get_settings
 
 logger = logging.getLogger("agentforge.api")
 
@@ -64,6 +66,47 @@ async def create_run(
     )
 
 
+@router.post(
+    "/runs/{run_id}/retry",
+    response_model=RunCreatedResponse,
+    status_code=201,
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+    summary="Retry a failed agent run",
+    description="Start a fresh run using the original goal.",
+)
+async def retry_run(
+    run_id: UUID,
+    session: AsyncSession = Depends(get_db),
+):
+    """Create a fresh run for a failed goal without altering its previous attempt."""
+    result = await session.execute(
+        select(AgentRun).where(AgentRun.id == run_id)
+    )
+    previous_run = result.scalar_one_or_none()
+    if previous_run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if previous_run.status != RunStatus.FAILED:
+        raise HTTPException(
+            status_code=409,
+            detail="Only failed runs can be retried.",
+        )
+
+    retry = AgentRun(goal=previous_run.goal, status=RunStatus.PLANNING)
+    session.add(retry)
+    await session.commit()
+    await session.refresh(retry)
+
+    asyncio.create_task(_execute_run_background(retry.id, retry.goal))
+    return RunCreatedResponse(
+        id=retry.id,
+        status=retry.status.value,
+        message="Retry started as a new run",
+    )
+
+
 async def _execute_run_background(run_id: UUID, goal: str) -> None:
     """Execute an agent run in the background with isolated database session."""
     factory = get_session_factory()
@@ -80,7 +123,40 @@ async def _execute_run_background(run_id: UUID, goal: str) -> None:
 
             llm = create_llm_provider()
             orchestrator = Orchestrator(llm)
-            await orchestrator.run_agent(run, session)
+            settings = get_settings()
+            await asyncio.wait_for(
+                orchestrator.run_agent(run, session),
+                timeout=settings.agent_run_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timeout_seconds = get_settings().agent_run_timeout_seconds
+            logger.error(
+                "Run %s exceeded its %d-second execution deadline",
+                run_id,
+                timeout_seconds,
+            )
+            await session.rollback()
+            result = await session.execute(
+                select(AgentRun)
+                .options(selectinload(AgentRun.tasks))
+                .where(AgentRun.id == run_id)
+            )
+            run = result.scalar_one_or_none()
+            if run is not None:
+                run.status = RunStatus.FAILED
+                run.error_message = (
+                    f"Run exceeded the {timeout_seconds}-second time limit. "
+                    "Try a shorter goal or retry."
+                )
+                run.completed_at = datetime.now(timezone.utc)
+                for task in run.tasks:
+                    if task.status in {TaskStatus.PENDING, TaskStatus.IN_PROGRESS}:
+                        task.status = TaskStatus.FAILED
+                        task.error_message = run.error_message
+                        task.completed_at = run.completed_at
+                        session.add(task)
+                session.add(run)
+                await session.commit()
 
         except Exception as e:
             logger.exception("Background execution failed for run %s: %s", run_id, str(e))

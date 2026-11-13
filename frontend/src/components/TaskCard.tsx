@@ -32,7 +32,7 @@ export default function TaskCard({
   const isActive = task.status === 'in_progress';
   const isCompleted = task.status === 'completed';
   const isFailed = task.status === 'failed';
-  const isFinalPass = task.title === 'Final Research and Synthesis';
+  const isFinalPass = ['Final Report', 'Final Research and Synthesis'].includes(task.title);
   const toolCalls = task.tool_calls || [];
 
   return (
@@ -84,7 +84,7 @@ export default function TaskCard({
             {isFinalPass && (
               <span className="inline-flex items-center gap-1 rounded-full bg-violet-400/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300">
                 <Sparkles size={9} />
-                Final pass
+                Report
               </span>
             )}
           </div>

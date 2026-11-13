@@ -3,6 +3,7 @@
 import logging
 from pydantic import BaseModel, Field
 
+from app.core.config import get_settings
 from app.tools.base import BaseTool, ToolResult
 from app.tools.search_provider import SearchProvider, get_search_provider, SearchProviderError
 
@@ -20,10 +21,10 @@ class WebSearchInput(BaseModel):
         examples=["software engineering internship 2nd year BTech Python 2025"],
     )
     max_results: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=10,
-        description="Maximum number of search results to retrieve (1 to 10, default 5)",
+        description="Maximum number of search results to retrieve (1 to 10, default 3)",
     )
 
 
@@ -41,9 +42,10 @@ class WebSearchTool(BaseTool):
     def __init__(self, provider: SearchProvider | None = None):
         self._provider = provider or get_search_provider()
 
-    async def execute(self, query: str, max_results: int = 5, **kwargs) -> ToolResult:
+    async def execute(self, query: str, max_results: int = 3, **kwargs) -> ToolResult:
         """Execute the web search."""
         cleaned_query = query.strip()
+        max_results = min(max_results, get_settings().max_search_results)
         logger.info("Executing web_search for query: '%s' (max_results=%d)", cleaned_query, max_results)
 
         try:

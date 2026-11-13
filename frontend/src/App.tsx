@@ -65,6 +65,11 @@ export default function App() {
     setView({ type: 'detail', runId });
   };
 
+  const handleRetryRun = (runId: string) => {
+    setView({ type: 'detail', runId });
+    fetchRuns();
+  };
+
   const handleBack = () => {
     setView({ type: 'dashboard' });
     fetchRuns();
@@ -123,7 +128,11 @@ export default function App() {
             />
           </div>
         ) : (
-          <RunDetail runId={view.runId} onBack={handleBack} />
+          <RunDetail
+            runId={view.runId}
+            onBack={handleBack}
+            onRetry={handleRetryRun}
+          />
         )}
 
         {/* Footer */}

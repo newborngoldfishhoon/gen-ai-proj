@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_model: str = Field(default="openai/gpt-oss-120b", alias="GROQ_MODEL")
     groq_max_concurrent_requests: int = Field(default=2, ge=1, alias="GROQ_MAX_CONCURRENT_REQUESTS")
-    groq_max_retries: int = Field(default=4, ge=0, le=8, alias="GROQ_MAX_RETRIES")
+    groq_max_retries: int = Field(default=0, ge=0, le=8, alias="GROQ_MAX_RETRIES")
     groq_retry_max_delay_seconds: float = Field(
         default=60, gt=0, alias="GROQ_RETRY_MAX_DELAY_SECONDS"
     )
@@ -49,14 +49,15 @@ class Settings(BaseSettings):
     agent_enable_calculator: bool = Field(default=True, alias="AGENT_ENABLE_CALCULATOR")
 
     # Agent and Tool limits
-    max_tasks: int = Field(default=6, alias="MAX_TASKS")
-    max_concurrent_tasks: int = Field(default=6, ge=1, alias="MAX_CONCURRENT_TASKS")
-    max_retries: int = Field(default=3, alias="MAX_RETRIES")
+    max_tasks: int = Field(default=1, ge=1, alias="MAX_TASKS")
+    max_concurrent_tasks: int = Field(default=1, ge=1, alias="MAX_CONCURRENT_TASKS")
+    max_retries: int = Field(default=1, ge=1, alias="MAX_RETRIES")
     max_goal_length: int = Field(default=2000, alias="MAX_GOAL_LENGTH")
-    max_search_results: int = Field(default=5, alias="MAX_SEARCH_RESULTS")
-    max_tool_calls_per_task: int = Field(default=5, alias="MAX_TOOL_CALLS_PER_TASK")
-    max_tool_calls_per_run: int = Field(default=15, alias="MAX_TOOL_CALLS_PER_RUN")
-    tool_timeout_seconds: int = Field(default=30, alias="TOOL_TIMEOUT_SECONDS")
+    max_search_results: int = Field(default=1, ge=1, le=10, alias="MAX_SEARCH_RESULTS")
+    max_tool_calls_per_task: int = Field(default=1, alias="MAX_TOOL_CALLS_PER_TASK")
+    max_tool_calls_per_run: int = Field(default=1, alias="MAX_TOOL_CALLS_PER_RUN")
+    tool_timeout_seconds: int = Field(default=8, ge=1, alias="TOOL_TIMEOUT_SECONDS")
+    agent_run_timeout_seconds: int = Field(default=35, ge=5, alias="AGENT_RUN_TIMEOUT_SECONDS")
     max_extracted_chars: int = Field(default=8000, alias="MAX_EXTRACTED_CHARS")
 
     # CORS

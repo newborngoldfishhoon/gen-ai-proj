@@ -6,6 +6,8 @@ import TaskCard from './TaskCard';
 import ToolTimeline from './ToolTimeline';
 import SourcePanel from './SourcePanel';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { renderToStaticMarkup } from 'react-dom/server';
 import {
   ArrowLeft,
   FileText,
@@ -20,14 +22,59 @@ import {
   Download,
   Layers3,
   Sparkles,
+  RefreshCw,
 } from 'lucide-react';
 
 interface RunDetailProps {
   runId: string;
   onBack: () => void;
+  onRetry: (runId: string) => void;
 }
 
 type TabType = 'tasks' | 'timeline' | 'sources' | 'report';
+type ExportFormat = 'markdown' | 'text' | 'html' | 'pdf';
+
+function createReportHtml(title: string, report: string): string {
+  const body = renderToStaticMarkup(
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>{report}</ReactMarkdown>
+  );
+  const escapedTitle = title.replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character] || character);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapedTitle}</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, Arial, sans-serif; color: #172033; background: #fff; }
+    body { margin: 0; padding: 48px 24px; }
+    main { max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 30px; line-height: 1.2; margin: 0 0 24px; letter-spacing: -.03em; }
+    h2 { font-size: 20px; margin: 28px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #e5e7eb; }
+    h3 { font-size: 16px; margin: 20px 0 8px; }
+    p, li { font-size: 14px; line-height: 1.65; }
+    ul, ol { padding-left: 22px; }
+    a { color: #175cd3; overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
+    th, td { border: 1px solid #d0d5dd; padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: #f2f4f7; }
+    blockquote { margin: 16px 0; padding: 4px 14px; border-left: 3px solid #98a2b3; color: #475467; }
+    code { font-family: Consolas, monospace; background: #f2f4f7; padding: 2px 4px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    @page { size: A4; margin: 18mm; }
+    @media print { body { padding: 0; } a { color: #175cd3; text-decoration: none; } h2, h3 { break-after: avoid; } table, blockquote { break-inside: avoid; } }
+  </style>
+</head>
+<body><main>${body}</main></body>
+</html>`;
+}
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '—';
@@ -44,12 +91,16 @@ function formatDuration(start: string, end: string | null): string {
   return `${mins}m ${remainSecs}s`;
 }
 
-export default function RunDetail({ runId, onBack }: RunDetailProps) {
+export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
   const [run, setRun] = useState<AgentRun | null>(null);
   const [error, setError] = useState<string>('');
   const [expandedTasks, setExpandedTasks] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<TabType>('tasks');
   const [copied, setCopied] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState('');
+  const [exportError, setExportError] = useState('');
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('markdown');
   const pollRef = useRef<number | null>(null);
 
   const fetchRun = useCallback(async () => {
@@ -111,15 +162,63 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
 
   const handleDownloadReport = () => {
     if (!run?.final_report) return;
-    const blob = new Blob([run.final_report], { type: 'text/markdown;charset=utf-8' });
+    const safeGoal = run.goal.slice(0, 60).replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim();
+    const baseName = `agentforge-report-${safeGoal || run.id.slice(0, 8)}`;
+    if (exportFormat === 'pdf') {
+      setExportError('');
+      const printWindow = window.open('', '_blank');
+      if (!printWindow) {
+        setExportError('Allow pop-ups to print or save the report as a PDF.');
+        return;
+      }
+      printWindow.document.open();
+      printWindow.document.write(createReportHtml(baseName, run.final_report));
+      printWindow.document.close();
+      window.setTimeout(() => {
+        printWindow.focus();
+        printWindow.print();
+      }, 250);
+      return;
+    }
+
+    const html = createReportHtml(baseName, run.final_report);
+    const content = exportFormat === 'markdown'
+      ? run.final_report
+      : exportFormat === 'text'
+      ? run.final_report
+          .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+          .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+          .replace(/^#{1,6}\s+/gm, '')
+          .replace(/[*_`~]/g, '')
+      : html;
+    const mimeType = exportFormat === 'html'
+      ? 'text/html;charset=utf-8'
+      : exportFormat === 'text'
+      ? 'text/plain;charset=utf-8'
+      : 'text/markdown;charset=utf-8';
+    const extension = exportFormat === 'html' ? 'html' : exportFormat === 'text' ? 'txt' : 'md';
+    const blob = new Blob([content], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `agentforge-report-${run.id.slice(0, 8)}.md`;
+    link.download = `${baseName}.${extension}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleRetry = async () => {
+    if (!run || retrying) return;
+    setRetrying(true);
+    setRetryError('');
+    try {
+      const retriedRun = await api.retryRun(run.id);
+      onRetry(retriedRun.id);
+    } catch (err) {
+      setRetryError(err instanceof Error ? err.message : 'Failed to retry this run');
+      setRetrying(false);
+    }
   };
 
   if (error && !run) {
@@ -153,9 +252,9 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
 
   const completedCount = run.tasks.filter((t) => t.status === 'completed').length;
   const activeCount = run.tasks.filter((t) => t.status === 'in_progress').length;
-  const finalPass = run.tasks.find((task) => task.title === 'Final Research and Synthesis');
+  const finalPass = run.tasks.find((task) => task.title === 'Final Report');
   const parallelTasks = run.tasks.filter(
-    (task) => task.title !== 'Final Research and Synthesis'
+    (task) => task.title !== 'Final Report'
   );
   const totalTasks = run.tasks.length;
   const progressPercent = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
@@ -163,28 +262,28 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
   const sources = run.sources || [];
   const workflowPhase = finalPass?.status === 'in_progress'
     ? {
-        title: 'Final research & synthesis',
-        description: 'The parallel findings are in. The final pass is checking for gaps and verifying important claims.',
+        title: 'Formatting report',
+        description: 'Research is complete. Findings and citations are being formatted into the report.',
         icon: <Sparkles size={16} className="text-violet-300" />,
         tone: 'border-violet-400/20 bg-violet-500/5',
       }
     : finalPass?.status === 'completed' || run.status === 'completed'
     ? {
-        title: 'Research and synthesis complete',
-        description: 'All parallel tasks and the final research pass have finished.',
+        title: 'Fast research complete',
+        description: 'The research answer and source list are ready.',
         icon: <Check size={16} className="text-emerald-300" />,
         tone: 'border-emerald-400/20 bg-emerald-500/5',
       }
     : activeCount > 0
     ? {
-        title: `Researching in parallel · ${activeCount} active`,
-        description: 'Independent research tasks are running together. A final verification and synthesis pass follows.',
+        title: 'Researching',
+        description: 'One focused research task is running with a single search to return results faster.',
         icon: <Layers3 size={16} className="text-blue-300" />,
         tone: 'border-blue-400/20 bg-blue-500/5',
       }
     : {
-        title: 'Preparing parallel research',
-        description: 'Independent tasks are being planned. After they finish, a final pass will review and connect the findings.',
+        title: 'Starting fast research',
+        description: 'Preparing one focused research task; the answer and source list are formatted without extra synthesis.',
         icon: <Layers3 size={16} className="text-brand-300" />,
         tone: 'border-brand-400/20 bg-brand-500/5',
       };
@@ -273,13 +372,31 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
         )}
 
         {/* Error message */}
-        {run.error_message && (
+        {(run.error_message || run.status === 'failed') && (
           <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
             <div className="flex items-start gap-2">
               <AlertTriangle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
-              <p className="text-sm text-red-400">{run.error_message}</p>
+              {run.error_message && (
+                <p className="text-sm text-red-400">{run.error_message}</p>
+              )}
             </div>
+            {run.status === 'failed' && (
+              <button
+                onClick={handleRetry}
+                disabled={retrying}
+                className="btn-secondary mt-3 text-xs py-1.5 px-3 disabled:opacity-50"
+              >
+                <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
+                {retrying ? 'Starting retry…' : 'Retry this run'}
+              </button>
+            )}
+            {retryError && (
+              <p role="alert" className="mt-2 text-xs text-red-300">{retryError}</p>
+            )}
           </div>
+        )}
+        {retryError && !run.error_message && (
+          <p role="alert" className="mt-2 text-xs text-red-300">{retryError}</p>
         )}
       </div>
 
@@ -359,7 +476,7 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
           {parallelTasks.length > 0 && (
             <div className="flex items-center gap-2 px-1 pt-1 pb-2 text-xs font-semibold uppercase tracking-wider text-surface-400">
               <Layers3 size={13} className="text-blue-300" />
-              Parallel Research
+              Research
               <span className="text-surface-600">({parallelTasks.length})</span>
             </div>
           )}
@@ -380,7 +497,7 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
             <>
               <div className="flex items-center gap-2 px-1 pt-4 pb-2 text-xs font-semibold uppercase tracking-wider text-surface-400">
                 <Sparkles size={13} className="text-violet-300" />
-                Final Pass
+                Final Report
               </div>
               <TaskCard
                 key={finalPass.id}
@@ -403,7 +520,7 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
       )}
 
       {activeTab === 'report' && run.final_report && (
-        <div className="glass-card overflow-hidden animate-fade-in">
+        <div className="report-card overflow-hidden animate-fade-in">
           <div className="p-4 bg-surface-800/80 border-b border-surface-700/40 flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <FileText size={18} className="text-brand-400" />
@@ -431,26 +548,42 @@ export default function RunDetail({ runId, onBack }: RunDetailProps) {
                 )}
               </button>
 
+              <label className="sr-only" htmlFor="report-export-format">Report export format</label>
+              <select
+                id="report-export-format"
+                value={exportFormat}
+                onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
+                className="rounded-lg border border-surface-600/50 bg-surface-700/50 px-2.5 py-1.5 text-xs text-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-500/40"
+              >
+                <option value="markdown">Markdown</option>
+                <option value="text">Plain text</option>
+                <option value="html">HTML</option>
+                <option value="pdf">PDF / Print</option>
+              </select>
               <button
                 onClick={handleDownloadReport}
                 className="btn-secondary text-xs py-1.5 px-3"
-                title="Download report as Markdown file"
+                title={exportFormat === 'pdf' ? 'Print or save the report as a PDF' : `Download ${exportFormat} report`}
               >
                 <Download size={14} />
-                Download
+                {exportFormat === 'pdf' ? 'Print / PDF' : 'Export'}
               </button>
             </div>
           </div>
 
-          <div className="p-6 markdown-content text-sm leading-relaxed">
+          {exportError && (
+            <p role="alert" className="px-4 pt-3 text-sm text-red-600">{exportError}</p>
+          )}
+          <div className="report-paper p-6 md:p-10 markdown-content text-sm leading-relaxed">
             <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
               components={{
                 a: ({ node, ...props }) => (
                   <a
                     {...props}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-brand-400 hover:text-brand-300 underline font-medium"
+                    className="text-blue-700 hover:text-blue-900 underline font-medium"
                   />
                 ),
               }}

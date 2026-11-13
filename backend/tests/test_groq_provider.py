@@ -398,6 +398,50 @@ async def test_large_context_accepted():
     assert sent["tool_choice"] == "none"
 
 
+@pytest.mark.asyncio
+async def test_413_compacts_payload_and_falls_back_without_tools():
+    """A repeated 413 progressively shrinks context and drops schemas as a last resort."""
+    too_large = _response(
+        _error_response("Request body is too large", "payload_too_large"),
+        status=413,
+    )
+    provider, transport = _make_provider([
+        too_large,
+        too_large,
+        too_large,
+        _response(_text_response("Recovered with compact context")),
+    ])
+
+    step = await provider.generate_step(
+        [{"role": "user", "content": "Research details " + ("x" * 30000)}],
+        tools=TOOL_DECLS,
+    )
+
+    assert not step.is_tool_call
+    assert step.content == "Recovered with compact context"
+    assert len(transport.requests) == 4
+
+    request_sizes = [len(request.content) for request in transport.requests]
+    assert request_sizes[0] > request_sizes[1] > request_sizes[2] > request_sizes[3]
+
+    final_payload = json.loads(transport.requests[-1].content)
+    assert final_payload["tool_choice"] == "none"
+    assert "tools" not in final_payload
+    assert any("payload limit" in message.get("content", "") for message in final_payload["messages"])
+
+
+def test_prune_messages_respects_serialized_size_limit():
+    messages = [
+        {"role": "system", "content": "System rules " + ("s" * 5000)},
+        {"role": "user", "content": "Goal " + ("g" * 12000) + " preserve this ending"},
+    ]
+
+    pruned = GroqProvider._prune_messages(messages, max_total_chars=5000)
+
+    assert len(json.dumps(pruned, ensure_ascii=False, separators=(",", ":"))) <= 5000
+    assert "preserve this ending" in pruned[-1]["content"]
+
+
 # ── Test 7: generate_json uses json_object mode ───────────────────────────────
 
 @pytest.mark.asyncio

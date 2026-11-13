@@ -3,9 +3,9 @@
 import pytest
 import pytest_asyncio
 
-from app.agent.executor import Executor
+from app.agent.executor import Executor, RunToolBudget
 from app.models.agent import AgentRun, AgentTask, RunStatus, TaskStatus
-from app.services.llm_provider import LLMProvider, LLMStepResponse
+from app.services.llm_provider import LLMProvider, LLMStepResponse, MockProvider
 
 
 class FailingProvider(LLMProvider):
@@ -19,6 +19,19 @@ class FailingProvider(LLMProvider):
 
     async def generate_step(self, messages, tools, *, system_instruction=None):
         raise RuntimeError("LLM unavailable")
+
+
+class CountingMockProvider(MockProvider):
+    def __init__(self):
+        super().__init__()
+        self.step_calls = 0
+
+    async def generate_step(self, messages, tools, *, system_instruction=None):
+        self.step_calls += 1
+        return LLMStepResponse(
+            is_tool_call=False,
+            content="One-call answer grounded in the search result.",
+        )
 
 
 @pytest.mark.asyncio
@@ -48,6 +61,40 @@ async def test_execute_task_success(mock_llm, db_session):
     assert task.result is not None
     assert task.started_at is not None
     assert task.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_fast_mode_searches_without_spending_an_llm_tool_selection_call(db_session):
+    run = AgentRun(goal="Research Python async best practices", status=RunStatus.RUNNING)
+    db_session.add(run)
+    await db_session.commit()
+    await db_session.refresh(run)
+
+    task = AgentTask(
+        run_id=run.id,
+        title="Research goal",
+        description=run.goal,
+        order_index=0,
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    provider = CountingMockProvider()
+    result, sources, tools_used = await Executor(provider).execute_task(
+        task=task,
+        goal=run.goal,
+        previous_results=[],
+        session=db_session,
+        tool_budget=RunToolBudget(1),
+        fast_mode=True,
+    )
+
+    assert provider.step_calls == 1
+    assert tools_used == 1
+    assert sources
+    assert "One-call answer" in result
 
 
 @pytest.mark.asyncio

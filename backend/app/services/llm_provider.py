@@ -284,26 +284,106 @@ class GroqProvider(LLMProvider):
         self._client = httpx.AsyncClient(
             base_url=self._BASE_URL,
             headers={"Authorization": f"Bearer {self._api_key}"},
-            timeout=60.0,
+            timeout=15.0,
         )
         logger.info("Groq provider initialized with model: %s", self._model)
+
+    @staticmethod
+    def _prune_messages(messages: list[dict], max_total_chars: int = 40000) -> list[dict]:
+        """Bound the serialized conversation while preserving its first and latest context."""
+        if not messages:
+            return messages
+
+        marker = "\n...[context truncated]...\n"
+
+        def shorten(text: str, limit: int) -> str:
+            if len(text) <= limit:
+                return text
+            if limit <= len(marker):
+                return text[:limit]
+            remaining = limit - len(marker)
+            head = (remaining + 1) // 2
+            tail = remaining - head
+            return text[:head] + marker + (text[-tail:] if tail else "")
+
+        pruned = [dict(message) for message in messages]
+        role_limits = {
+            "system": 8000,
+            "user": 10000,
+            "assistant": 4000,
+            "tool": 2500,
+        }
+        for message in pruned:
+            content = message.get("content")
+            if isinstance(content, str):
+                limit = role_limits.get(message.get("role"), 4000)
+                message["content"] = shorten(content, limit)
+
+        def serialized_size() -> int:
+            return len(json.dumps(pruned, ensure_ascii=False, separators=(",", ":")))
+
+        while serialized_size() > max_total_chars:
+            candidates = [
+                (index, message)
+                for index, message in enumerate(pruned)
+                if isinstance(message.get("content"), str)
+                and len(message["content"]) > 256
+            ]
+            if not candidates:
+                break
+
+            index, message = max(
+                candidates,
+                key=lambda item: (
+                    item[1].get("role") == "tool",
+                    len(item[1]["content"]),
+                    -item[0],
+                ),
+            )
+            content = message["content"]
+            minimum = 0 if message.get("role") == "tool" else 256
+            reduction = max(128, serialized_size() - max_total_chars)
+            target = max(minimum, len(content) - reduction)
+            if target == len(content):
+                target = max(minimum, len(content) - 128)
+            message["content"] = shorten(content, target)
+
+        while serialized_size() > max_total_chars:
+            exchange_index = next(
+                (
+                    index
+                    for index in range(len(pruned) - 1)
+                    if pruned[index].get("role") == "assistant"
+                    and pruned[index].get("tool_calls")
+                    and pruned[index + 1].get("role") == "tool"
+                ),
+                None,
+            )
+            if exchange_index is None:
+                break
+            del pruned[exchange_index:exchange_index + 2]
+
+        return pruned
 
     async def _chat(self, messages: list[dict], **kwargs) -> dict:
         """Make a raw chat completions call and return the parsed JSON.
 
         Key behaviour:
+        - Automatically prunes oversized tool context to avoid HTTP 413.
         - When ``tools`` is non-empty, sends ``tool_choice='auto'``.
         - When no tools are provided, sends ``tool_choice='none'``.
         - Retries transient network, 429, and server errors with bounded backoff.
+        - Compacts request context immediately after a 413 payload-too-large response.
         - Shares a cooldown and request concurrency limit across runs.
         - Handles 400 "Tool choice is none, but model called a tool" by retrying with
           an explicit disallow system message so the generation does not fail.
         """
         tools = kwargs.get("tools") or []
         max_tokens = kwargs.get("max_tokens", 2048)
+        pruned_messages = self._prune_messages(messages)
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": messages,
+            "messages": pruned_messages,
             "temperature": kwargs.get("temperature", 0.7),
             "max_tokens": max_tokens,
         }
@@ -317,7 +397,8 @@ class GroqProvider(LLMProvider):
 
         max_retries = self._max_retries
         gate = _get_groq_request_gate()
-        for attempt in range(max_retries + 1):
+        tools_disabled_by_413 = False
+        for attempt in range(max(max_retries, 1) + 1):
             try:
                 async with gate:
                     resp = await self._client.post("/chat/completions", json=payload)
@@ -379,6 +460,49 @@ class GroqProvider(LLMProvider):
                     max_retries,
                 )
                 await asyncio.sleep(wait_s)
+                continue
+
+            # A 413 is deterministic: compact the body immediately instead of waiting
+            # through transient-error backoff. Disable tools as a last-resort retry.
+            if resp.status_code == 413 and attempt < max_retries:
+                if tools and attempt >= 2:
+                    payload.pop("tools", None)
+                    payload["tool_choice"] = "none"
+                    tools = []
+                    tools_disabled_by_413 = True
+                    tool_fallback = (
+                        "Tools are disabled because the request exceeded the provider's "
+                        "payload limit. Answer using the available conversation context only."
+                    )
+                    if payload["messages"] and payload["messages"][0].get("role") == "system":
+                        payload["messages"][0]["content"] += f"\n\n{tool_fallback}"
+                    else:
+                        payload["messages"].insert(
+                            0,
+                            {"role": "system", "content": tool_fallback},
+                        )
+
+                target_chars = max(2000, 16000 // (2 ** (attempt + 1)))
+                payload["messages"] = self._prune_messages(
+                    payload["messages"],
+                    max_total_chars=target_chars,
+                )
+                payload["max_tokens"] = max(
+                    512,
+                    int(payload.get("max_tokens", 2048) * 0.75),
+                )
+                logger.warning(
+                    "Groq 413; retrying with a %d-byte request and tool calling %s "
+                    "(attempt %d/%d).",
+                    len(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+                    (
+                        "disabled" if tools_disabled_by_413
+                        else "enabled" if tools
+                        else "not requested"
+                    ),
+                    attempt + 1,
+                    max_retries,
+                )
                 continue
 
             # Handle 400 "Tool choice is none, but model called a tool" / tool_use_failed
