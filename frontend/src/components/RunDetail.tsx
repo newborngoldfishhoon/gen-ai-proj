@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import type { AgentRun } from '../types/agent';
 import api from '../services/api';
 import StatusBadge from './StatusBadge';
@@ -294,48 +294,47 @@ export default function RunDetail({ runId, onBack, onRetry }: RunDetailProps) {
   const [exportError, setExportError] = useState('');
   const [isExportingPdf, setIsExportingPdf] = useState(false);
   const [exportFormat, setExportFormat] = useState<ExportFormat>('pdf');
-  const pollRef = useRef<number | null>(null);
+  const runRef = useRef<AgentRun | null>(null);
   const exportResourceTask = run?.tasks.find((task) => task.title === 'Resource research');
   const exportResources = exportResourceTask
     ? run?.sources.filter((source) => source.task_id === exportResourceTask.id) || []
     : [];
 
-  const fetchRun = useCallback(async () => {
-    try {
-      const data = await api.getRun(runId);
-      setRun(data);
-      setError('');
-
-      // Auto-switch to report tab on first completion
-      if (data.status === 'completed' && data.final_report && activeTab === 'tasks') {
-        // Keep current tab, but notify user
-      }
-
-      // Stop polling when terminal
-      if (data.status === 'completed' || data.status === 'failed') {
-        if (pollRef.current) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load run');
-    }
-  }, [runId, activeTab]);
-
   useEffect(() => {
-    fetchRun();
+    let active = true;
+    let timeoutId: number | undefined;
+    runRef.current = null;
+    setRun(null);
 
-    // Poll every 2 seconds while active
-    pollRef.current = window.setInterval(fetchRun, 2000);
+    const poll = async () => {
+      try {
+        const data = await api.getRun(runId);
+        if (!active) return;
+
+        const previousRun = runRef.current;
+        const wasTerminal = previousRun?.status === 'completed' || previousRun?.status === 'failed';
+        const isTerminal = data.status === 'completed' || data.status === 'failed';
+        if (wasTerminal && !isTerminal) return;
+
+        runRef.current = data;
+        setRun(data);
+        setError('');
+        if (isTerminal) return;
+      } catch (err) {
+        if (!active) return;
+        setError(err instanceof Error ? err.message : 'Failed to load run');
+      }
+
+      if (active) timeoutId = window.setTimeout(poll, 2000);
+    };
+
+    void poll();
 
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      active = false;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     };
-  }, [fetchRun]);
+  }, [runId]);
 
   const toggleTask = (taskId: string) => {
     setExpandedTasks((prev) => {

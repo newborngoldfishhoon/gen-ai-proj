@@ -46,6 +46,7 @@ async function request<T>(
       },
       ...options,
       signal: controller.signal,
+      cache: 'no-store',
     });
 
     if (!response.ok) {
