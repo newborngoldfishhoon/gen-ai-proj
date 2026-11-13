@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import type { RunListItem } from './types/agent';
 import api from './services/api';
 import GoalInput from './components/GoalInput';
 import LoginGate from './components/LoginGate';
 import RunHistory from './components/RunHistory';
-import RunDetail from './components/RunDetail';
 import { clearGuestSession, GUEST_SESSION_KEY, startGuestSession, supabase } from './lib/supabase';
 import { Cpu, AlertTriangle, LogOut, RefreshCw, UserRound } from 'lucide-react';
+
+const RunDetail = lazy(() => import('./components/RunDetail'));
 
 type View = { type: 'dashboard' } | { type: 'detail'; runId: string };
 
@@ -264,11 +265,19 @@ export default function App() {
             />
           </div>
         ) : (
-          <RunDetail
-            runId={view.runId}
-            onBack={handleBack}
-            onRetry={handleRetryRun}
-          />
+          <Suspense
+            fallback={
+              <div className="glass-card mx-auto max-w-md p-8 text-center text-sm text-surface-400">
+                Loading run…
+              </div>
+            }
+          >
+            <RunDetail
+              runId={view.runId}
+              onBack={handleBack}
+              onRetry={handleRetryRun}
+            />
+          </Suspense>
         )}
 
         {/* Footer */}
