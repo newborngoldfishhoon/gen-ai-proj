@@ -7,6 +7,8 @@ interface RunHistoryProps {
   runs: RunListItem[];
   onSelectRun: (runId: string) => void;
   isLoading: boolean;
+  historyError?: string;
+  onRefresh?: () => void;
   isGuest?: boolean;
   onSignIn?: () => Promise<void>;
 }
@@ -31,6 +33,8 @@ export default function RunHistory({
   runs,
   onSelectRun,
   isLoading,
+  historyError,
+  onRefresh,
   isGuest = false,
   onSignIn,
 }: RunHistoryProps) {
@@ -61,6 +65,16 @@ export default function RunHistory({
             ? 'Sign in with Google to save your research and view it again later.'
             : 'Submit a goal above to start your first agent run.'}
         </p>
+        {historyError && (
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs text-amber-300">
+            <span>{historyError}</span>
+            {onRefresh && (
+              <button onClick={onRefresh} className="underline underline-offset-2">
+                Retry
+              </button>
+            )}
+          </div>
+        )}
         {isGuest && onSignIn && (
           <button onClick={() => void onSignIn()} className="btn-secondary mt-4 text-xs">
             Sign in with Google to save history
@@ -75,6 +89,16 @@ export default function RunHistory({
       <h3 className="text-sm font-medium text-surface-400 uppercase tracking-wider mb-4">
         Recent Runs
       </h3>
+      {historyError && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
+          <span>{historyError}</span>
+          {onRefresh && (
+            <button onClick={onRefresh} className="shrink-0 underline underline-offset-2">
+              Retry
+            </button>
+          )}
+        </div>
+      )}
       <div className="space-y-2">
         {runs.map((run) => (
           <button

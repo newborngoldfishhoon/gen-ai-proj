@@ -18,10 +18,12 @@ export default function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingRuns, setIsLoadingRuns] = useState(true);
   const [error, setError] = useState('');
+  const [historyError, setHistoryError] = useState('');
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [isGuest, setIsGuest] = useState(false);
   const hasLoadedRuns = useRef(false);
+  const isFetchingRuns = useRef(false);
   const activeUserId = useRef<string | null>(null);
 
   useEffect(() => {
@@ -74,30 +76,49 @@ export default function App() {
       setIsLoadingRuns(false);
       return;
     }
+    if (isFetchingRuns.current) return;
+    isFetchingRuns.current = true;
+    const userId = session.user.id;
     try {
       const data = await api.listRuns(20, 0);
+      if (activeUserId.current !== userId) return;
       setRuns(data.runs);
       hasLoadedRuns.current = true;
-      setError('');
+      setHistoryError('');
     } catch (err) {
+      if (activeUserId.current !== userId) return;
       if (!hasLoadedRuns.current) {
-        setError(
+        setHistoryError(
           err instanceof Error
-            ? err.message
-            : 'Failed to connect to the backend'
+            ? `Could not load saved history: ${err.message}`
+            : 'Could not load saved history. It will retry automatically.'
         );
+      } else {
+        setHistoryError('Could not refresh saved history. Retrying automatically.');
       }
     } finally {
-      setIsLoadingRuns(false);
+      isFetchingRuns.current = false;
+      if (activeUserId.current === userId) setIsLoadingRuns(false);
     }
   }, [session]);
 
   useEffect(() => {
     if (!authReady) return;
-    fetchRuns();
-    if (!session) return;
-    const interval = setInterval(fetchRuns, 5000);
-    return () => clearInterval(interval);
+    let active = true;
+    let timeoutId: number | undefined;
+
+    const pollRuns = async () => {
+      await fetchRuns();
+      if (active && session) {
+        timeoutId = window.setTimeout(pollRuns, 10_000);
+      }
+    };
+
+    void pollRuns();
+    return () => {
+      active = false;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
   }, [authReady, fetchRuns, session]);
 
   const handleGoogleSignIn = async () => {
@@ -260,6 +281,8 @@ export default function App() {
               runs={runs}
               onSelectRun={handleSelectRun}
               isLoading={isLoadingRuns}
+              historyError={historyError}
+              onRefresh={() => void fetchRuns()}
               isGuest={isGuest}
               onSignIn={handleGoogleSignInClick}
             />
